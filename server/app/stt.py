@@ -63,21 +63,29 @@ class GatedTranscription:
 class GatedTranscriber:
     """Whisper output gated by phoneme-alignment plausibility.
 
-    Two signals are checked against the audio's wav2vec2 phoneme
+    Three signals are checked against the audio's wav2vec2 phoneme
     distribution:
 
       * Mean alignment log-prob of Whisper's text. Hallucinated
         transcriptions don't actually fit the audio, so the alignment
         score collapses far below the typical -1 to -1.5 range.
-      * Phoneme density (phonemes per second of audio). Normal speech
+      * Phoneme density too high (over-production). Normal speech
         runs ~10-15 phonemes/s; a Whisper hallucination of 30+
         phonemes for 1 s of audio is physically impossible.
+      * Phoneme density too low (under-production). The opposite
+        failure mode: Whisper drops most of the audio and emits a
+        short transcription that doesn't account for what was said
+        ("...about my grandfather" → "You will soon..."). The
+        alignment score is silent on this because it can find the
+        few proposed phonemes somewhere in the audio. Only checked
+        on utterances longer than ``density_check_min_duration_s``
+        so we don't false-flag legitimately short single-word
+        stimuli.
 
-    Either signal alone is enough to flag a clip. The intent is *not*
-    to correct the transcription — empirically the phoneme pipeline
-    can't do that — but to refuse to confidently surface a
-    transcription the audio doesn't support. Critical for medical
-    settings where confident-wrong is worse than uncertain.
+    Any single signal alone is enough to flag a clip. The intent is
+    not to correct the transcription — empirically the phoneme
+    pipeline can't do that — but to refuse to confidently surface a
+    transcription the audio doesn't support.
     """
 
     def __init__(
@@ -89,6 +97,8 @@ class GatedTranscriber:
         sample_rate: int = 16000,
         min_alignment_score: float = -1.0,
         max_phoneme_density: float = 25.0,
+        min_phoneme_density: float = 3.0,
+        density_check_min_duration_s: float = 4.0,
     ) -> None:
         self._transcriber = transcriber
         self._extractor = extractor
@@ -97,6 +107,8 @@ class GatedTranscriber:
         self._sample_rate = sample_rate
         self._min_alignment = min_alignment_score
         self._max_density = max_phoneme_density
+        self._min_density = min_phoneme_density
+        self._min_density_duration = density_check_min_duration_s
 
     def transcribe_with_gate(
         self,
@@ -123,9 +135,6 @@ class GatedTranscriber:
                 flagged=False, reason=None,
             )
 
-        duration_s = max(audio.size / self._sample_rate, 1e-3)
-        density = len(phonemes) / duration_s
-
         if probs is None:
             probs = self._extractor.extract(audio, self._sample_rate)
         log_probs = np.log(np.clip(probs, 1e-12, 1.0))
@@ -134,9 +143,26 @@ class GatedTranscriber:
         )
         score = alignment_score(aligned)
 
+        duration_s = max(audio.size / self._sample_rate, 1e-3)
+        density = len(phonemes) / duration_s
+
         reason: str | None = None
         if density > self._max_density:
             reason = "phoneme_density"
+        elif (
+            duration_s >= self._min_density_duration
+            and density < self._min_density
+        ):
+            # Under-production: long-form audio whose proposed
+            # transcription has too few phonemes to plausibly account
+            # for the duration. Only checked above min_density_duration
+            # so single-word stimuli aren't false-flagged. Threshold and
+            # duration are conservative to keep FP rate low — this still
+            # misses some under-production cases but the alternative
+            # (speech-region density via blank-token thresholding) was
+            # ambiguous between "correctly short" and "incorrectly short"
+            # transcriptions.
+            reason = "underproduction"
         elif score < self._min_alignment:
             reason = "low_alignment"
         return GatedTranscription(

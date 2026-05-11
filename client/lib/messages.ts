@@ -69,7 +69,7 @@ export type TranslationMessage = {
   // The UI renders flagged outputs with a red border + "uncertain" hint
   // — text stays visible, but it isn't presented as confidently correct.
   flagged?: boolean;
-  reason?: "low_alignment" | "phoneme_density" | null;
+  reason?: "low_alignment" | "phoneme_density" | "underproduction" | null;
   align_score?: number;
   phoneme_density?: number;
 };
