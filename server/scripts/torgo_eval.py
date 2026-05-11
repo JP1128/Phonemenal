@@ -52,6 +52,7 @@ _CTC_SPECIALS = {"<pad>", "<s>", "</s>", "<unk>", "|", " "}
 class ClipResult:
     speaker_id: str
     condition: str
+    prompt_set: str
     intended_text: str
     duration_ms: int
     per: float
@@ -174,6 +175,7 @@ def evaluate_clip(
     return ClipResult(
         speaker_id=clip["speaker_id"],
         condition=clip.get("condition") or "?",
+        prompt_set=clip.get("prompt_set") or "?",
         intended_text=text,
         duration_ms=int(clip.get("duration_ms") or 0),
         per=per,
@@ -223,46 +225,69 @@ def _print_per_clip(rows: Iterable[ClipResult], with_whisper: bool) -> None:
 
 
 def _print_summary(rows: list[ClipResult], with_whisper: bool) -> None:
-    by_key: dict[tuple[str, str], SpeakerStats] = {}
-    for r in rows:
-        key = (r.speaker_id, r.condition)
-        bucket = by_key.setdefault(key, SpeakerStats())
-        bucket.n += 1
-        bucket.per_values.append(r.per)
-        if r.align_score != float("-inf"):
-            bucket.align_values.append(r.align_score)
-        if r.whisper_wer is not None:
-            bucket.whisper_wers.append(r.whisper_wer)
+    """Two summaries: per (speaker, condition) and per (speaker, prompt_set).
 
+    The prompt-set breakout matters because isolated single-word stimuli have
+    very different recognition profiles than TIMIT sentences — averaging
+    across both hides which conditions the model actually struggles with.
+    """
     print()
-    print("== summary ==")
+    _print_grouped(rows, group_key=lambda r: (r.speaker_id, r.condition),
+                   header_cols=("speaker", "cond"), with_whisper=with_whisper,
+                   title="summary by speaker × condition")
+    print()
+    _print_grouped(rows, group_key=lambda r: (r.speaker_id, r.prompt_set),
+                   header_cols=("speaker", "set"), with_whisper=with_whisper,
+                   title="summary by speaker × prompt_set")
+
+
+def _print_grouped(
+    rows: list[ClipResult],
+    *,
+    group_key,
+    header_cols: tuple[str, str],
+    with_whisper: bool,
+    title: str,
+) -> None:
+    buckets: dict[tuple[str, str], SpeakerStats] = {}
+    for r in rows:
+        key = group_key(r)
+        b = buckets.setdefault(key, SpeakerStats())
+        b.n += 1
+        b.per_values.append(r.per)
+        if r.align_score != float("-inf"):
+            b.align_values.append(r.align_score)
+        if r.whisper_wer is not None:
+            b.whisper_wers.append(r.whisper_wer)
+
+    print(f"== {title} ==")
+    c1, c2 = header_cols
     if with_whisper:
         header = (
-            f"{'speaker':<7} {'cond':<10} {'n':>4} "
+            f"{c1:<7} {c2:<15} {'n':>4} "
             f"{'PER_mean':>9} {'PER_p50':>8} {'align':>7}  {'WERw_mean':>9}"
         )
     else:
         header = (
-            f"{'speaker':<7} {'cond':<10} {'n':>4} "
+            f"{c1:<7} {c2:<15} {'n':>4} "
             f"{'PER_mean':>9} {'PER_p50':>8} {'align':>7}"
         )
     print(header)
     print("-" * len(header))
-    for (speaker, cond), s in sorted(by_key.items()):
+    for key, s in sorted(buckets.items()):
+        a, b = key
         per_mean = float(np.mean(s.per_values)) if s.per_values else float("nan")
         per_med = _percentile(s.per_values, 50)
         align = float(np.mean(s.align_values)) if s.align_values else float("nan")
         if with_whisper:
-            wer_mean = (
-                float(np.mean(s.whisper_wers)) if s.whisper_wers else float("nan")
-            )
+            wer_mean = float(np.mean(s.whisper_wers)) if s.whisper_wers else float("nan")
             print(
-                f"{speaker:<7} {cond:<10} {s.n:>4} "
+                f"{a:<7} {b:<15} {s.n:>4} "
                 f"{per_mean:>9.3f} {per_med:>8.3f} {align:>7.2f}  {wer_mean:>9.3f}"
             )
         else:
             print(
-                f"{speaker:<7} {cond:<10} {s.n:>4} "
+                f"{a:<7} {b:<15} {s.n:>4} "
                 f"{per_mean:>9.3f} {per_med:>8.3f} {align:>7.2f}"
             )
 
