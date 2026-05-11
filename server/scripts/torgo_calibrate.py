@@ -33,6 +33,7 @@ from app.config import settings  # noqa: E402
 from app.db import connect, list_torgo_clips  # noqa: E402
 from app.distortion import build_profile  # noqa: E402
 from app.phonemes import PhonemeExtractor  # noqa: E402
+from scripts.splits import filter_by_split  # noqa: E402
 
 
 def _load_audio(path: str) -> np.ndarray | None:
@@ -65,6 +66,13 @@ def main() -> int:
         default=True,
         help="Skip clips whose prompt_set is 'non-word' (DDK-style stimuli).",
     )
+    parser.add_argument(
+        "--split",
+        choices=("cal", "eval", "all"),
+        default="cal",
+        help="Which split to calibrate on. Default: cal (the 80%% the eval "
+        "harness never sees).",
+    )
     args = parser.parse_args()
 
     extractor = PhonemeExtractor(settings.phoneme_model_name, device=settings.device)
@@ -76,11 +84,17 @@ def main() -> int:
     speakers = [s.strip() for s in args.speakers.split(",")]
 
     for speaker_id in speakers:
-        clips = list_torgo_clips(conn, speaker_id=speaker_id, limit=args.max_clips)
+        # Pull all clips, apply the split, then truncate — so --max-clips
+        # selects the first N clips of the requested split rather than
+        # filtering after a possibly-truncated SQL LIMIT.
+        clips = list_torgo_clips(conn, speaker_id=speaker_id, limit=1_000_000)
+        clips = filter_by_split(clips, args.split)
+        if args.max_clips:
+            clips = clips[: args.max_clips]
         if not clips:
             print(f"[skip] {speaker_id}: no clips in manifest")
             continue
-        print(f"\n=== {speaker_id} ({len(clips)} clips) ===")
+        print(f"\n=== {speaker_id} ({len(clips)} clips, split={args.split}) ===")
 
         aligned_utterances = []
         rejected_low_score = 0

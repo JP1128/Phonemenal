@@ -42,6 +42,7 @@ from app.config import settings  # noqa: E402
 from app.db import connect, list_torgo_clips  # noqa: E402
 from app.phonemes import PhonemeExtractor  # noqa: E402
 from app.vocab import normalize_phonemes  # noqa: E402
+from scripts.splits import filter_by_split  # noqa: E402
 
 
 # CTC special tokens we never want to decode as actual phonemes.
@@ -315,6 +316,13 @@ def main() -> int:
         help="Max clips per speaker (deterministic by id order). 0 = all.",
     )
     parser.add_argument(
+        "--split",
+        choices=("cal", "eval", "all"),
+        default="eval",
+        help="Held-out partition to evaluate on. Default: eval (the 20%% the "
+        "calibration step never sees).",
+    )
+    parser.add_argument(
         "--with-whisper",
         action="store_true",
         help="Also run faster-whisper as a baseline. Slower (~0.5s per clip on CPU).",
@@ -357,14 +365,17 @@ def main() -> int:
     all_rows: list[ClipResult] = []
     started = time.monotonic()
     for spk in speakers:
+        # Pull every candidate, then filter by split + non-word, then truncate
+        # to --limit. If we limited at SQL time, the split would non-uniformly
+        # sample by clip id and small --limit values would skew the eval set.
         clips = list_torgo_clips(
-            conn,
-            speaker_id=spk,
-            condition=args.condition,
-            limit=args.limit if args.limit else 1_000_000,
+            conn, speaker_id=spk, condition=args.condition, limit=1_000_000
         )
         if not args.include_non_word:
             clips = [c for c in clips if c.get("prompt_set") != "non-word"]
+        clips = filter_by_split(clips, args.split)
+        if args.limit:
+            clips = clips[: args.limit]
         if not clips:
             print(f"[skip] {spk or 'all'}: no clips after filters")
             continue
