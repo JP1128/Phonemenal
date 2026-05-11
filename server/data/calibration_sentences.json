@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "sets": [
+    {
+      "id": "basic_needs",
+      "label": "Basic Needs",
+      "description": "Common requests a patient needs to communicate to caregivers.",
+      "sentences": [
+        "I need water.",
+        "I am hungry.",
+        "I need to use the bathroom.",
+        "Please help me sit up.",
+        "Please help me lie down.",
+        "I am cold.",
+        "I am hot.",
+        "Please bring my glasses.",
+        "Please bring my phone.",
+        "I am ready to sleep."
+      ]
+    },
+    {
+      "id": "medical",
+      "label": "Medical Communication",
+      "description": "Phrases used with doctors, nurses, and therapists.",
+      "sentences": [
+        "I am in pain.",
+        "My head hurts.",
+        "My chest feels tight.",
+        "I feel dizzy.",
+        "I cannot breathe well.",
+        "Please call the doctor.",
+        "When do I take my medicine.",
+        "Yes that helps.",
+        "No that makes it worse.",
+        "Where is the bathroom."
+      ]
+    },
+    {
+      "id": "emotional",
+      "label": "Emotional Expression",
+      "description": "Sentences that exercise prosody and expressive vocabulary.",
+      "sentences": [
+        "I am happy to see you.",
+        "I am scared.",
+        "I love you.",
+        "I am angry.",
+        "I miss my family.",
+        "Thank you very much.",
+        "I am sorry.",
+        "I am tired today.",
+        "I feel hopeful.",
+        "I do not feel well."
+      ]
+    },
+    {
+      "id": "common_sounds",
+      "label": "Common Sounds",
+      "description": "TIMIT-style sentences chosen to cover the English phoneme inventory.",
+      "sentences": [
+        "She had your dark suit in greasy wash water all year.",
+        "Don't ask me to carry an oily rag like that.",
+        "The quick brown fox jumps over the lazy dog.",
+        "How are you feeling today.",
+        "I would like a cup of tea.",
+        "The sun is shining outside.",
+        "Birds are singing in the garden.",
+        "Pack my box with five dozen liquor jugs.",
+        "Please pass the salt and pepper.",
+        "Can you turn the light on."
+      ]
+    }
+  ]
+}
