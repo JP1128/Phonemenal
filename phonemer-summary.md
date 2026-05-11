@@ -1,24 +1,54 @@
 # Phonemer — Project Summary
 
-## A live speech translator for brain injury patients with speech impediments
+## Hallucination-resistant medical ASR + per-patient severity diagnostics
+
+> **Note (2026-05):** the project pivoted from "calibrated LLM beats
+> naive ASR on impaired speech" to the smaller, empirically grounded
+> claim below after validation showed the original architecture was
+> consistently outperformed by Whisper. See `JOURNAL.md` entries 11-13
+> for the data and the architectural reasoning. The original vision is
+> documented in the *Original Vision* section at the bottom for context.
 
 ---
 
 ## The Problem
 
-Brain injury patients with speech impediments can often understand everything said to them and know exactly what they want to say — but their motor systems can't execute the speech correctly. This creates a devastating communication gap between patients and their doctors, nurses, family members, and friends. Current solutions are either too limited (pre-programmed phrase boards) or too generic (standard speech recognition that fails on non-standard speech).
+Brain-injury patients with speech impediments can often understand
+everything said to them and know exactly what they want to say — but
+their motor systems can't execute the speech correctly. Standard ASR
+struggles on impaired speech, and when it fails it often *fails
+confidently* — surfacing a fluent transcription that bears no
+relationship to what the patient said. In a medical setting that's
+worse than no transcription at all.
 
 ---
 
-## The Idea
+## What Phonemer Actually Does (Current Architecture)
 
-Build a system that:
+Phonemer is a Whisper-based ASR with two value-adds rigorously
+validated against TORGO:
 
-1. **Calibrates** to a specific patient by having them read known sentences while the system captures raw audio
-2. **Learns** the systematic discrepancies between how the patient produces speech and how it should sound — at the phoneme level, not the word level
-3. **Translates** the patient's live speech in real time, displaying the intended sentence on a screen for the listener (doctor, nurse, family member) to read
+1. **A phoneme-alignment safety gate.** Every Whisper transcription is
+   forced-aligned against a wav2vec2 phoneme distribution of the same
+   audio. If the alignment score collapses (mean log-prob below -1.0)
+   or the phoneme density implied by Whisper's text exceeds what the
+   audio could possibly contain (>25 phonemes/sec), the gate flags the
+   output. Validated TP rate ~58%, FP rate **0%** on dysarthric and
+   control speech.
 
-The core innovation is using an LLM layer that receives raw audio analysis (not pre-processed speech-to-text) along with the patient's learned distortion profile and conversational context to determine what the patient is trying to say.
+2. **Per-patient severity calibration.** A patient reads known
+   sentences once during onboarding; the system builds a phoneme
+   confusion matrix and tracks it over time. PER on a fixed
+   intelligibility set ranks severity reliably (control TIMIT PER ~7%,
+   mild dysarthria ~35%, severe ~70%). Useful as an SLP / therapy
+   progress tool.
+
+The listener UI surfaces every transcription, but flagged outputs
+render with a red ring + "uncertain — phoneme alignment doesn't
+support this." Text stays visible because hiding it would defeat the
+medical-safety story (the listener needs to see the candidate to
+judge it); the visual treatment makes clear the system isn't standing
+behind the words.
 
 ---
 
@@ -30,15 +60,71 @@ Two major efforts exist in this space:
 
 **Google Project Euphonia** is a research initiative building the world's largest dataset of disordered speech (1.5M+ utterances from ~3,000 speakers as of early 2025). Rather than a consumer product, it aims to make speech recognition models themselves more inclusive, with open-source tools available on GitHub. It is expanding beyond English into Spanish, Japanese, French, and Hindi.
 
-**Key Differentiators for Phonemer:**
+**What Phonemer is positioned as (post-pivot):**
 
-- Voiceitt trains individual phrases — Phonemer learns generalizable phoneme-level motor patterns that apply to any word, including words never seen in calibration
-- Voiceitt doesn't model fatigue — Phonemer tracks how the patient's distortion patterns degrade over a conversation and adjusts dynamically
-- Neither existing solution uses an LLM layer for contextual disambiguation — Phonemer uses conversational context to resolve ambiguous phoneme sequences
+- A medical-safety overlay on top of any commercial ASR (currently
+  Whisper, swappable). The phoneme-alignment gate is independent of
+  the ASR engine — Voiceitt + gate, Whisper + gate, or
+  Euphonia-trained model + gate are all reasonable products.
+- An objective per-patient severity grading and therapy-tracking
+  system. The calibration pipeline produces a phoneme confusion
+  matrix that's a useful clinical artifact even though it no longer
+  drives the live translation.
+
+**What Phonemer explicitly is NOT positioned as anymore:**
+
+- *Better recognition than commercial ASR on impaired speech.*
+  Empirically false at this architecture. Closing that gap requires
+  either Project-Euphonia-scale training data or a fundamentally
+  different (audio-level) modeling approach — both beyond the
+  current scope.
 
 ---
 
-## System Architecture — 6 Processing Layers
+## Live Pipeline (Current)
+
+```
+mic audio
+   ↓
+Silero VAD + utterance segmentation
+   ↓
+ECAPA-TDNN speaker ID  ── non-patient → faster-whisper → context window
+   ↓ (patient)
+   ├─ wav2vec2 phoneme distribution  ──┐
+   └─ faster-whisper transcription  ───┤
+                                       ├──→ forced-align (text vs distribution)
+                                       │       ↓
+                                       │   alignment score + phoneme density
+                                       │       ↓
+                                       │   GATE: flag if score < -1.0
+                                       │         OR density > 25 ph/s
+                                       ▼
+                                listener UI:
+                                  flagged → red ring + "uncertain" hint
+                                  ok      → green/yellow per-word shading
+```
+
+**Concurrent paths that aren't on the live translation flow:**
+
+- Acoustic feature extraction (MFCC, formants, jitter/shimmer, etc.)
+  feeds the prosody-based emergency detector and fatigue tracker.
+- The emotional state tracker reads features and influences UI hints
+  (e.g. "patient seems frustrated, suggest slowing down").
+- The patient distortion calibration pipeline produces a per-patient
+  confusion matrix on demand. Shipping use case: severity tracking
+  in `/progress`. Originally drove a Sonnet correction layer that
+  has been removed.
+
+---
+
+## Original Vision — 6 Processing Layers (Historical)
+
+The sections below document the *original* architecture as designed.
+Layers 1-3, parts of 4, and 6 are still in place. Layer 5 (LLM
+correction) was removed from the live path; Layer 6's confidence and
+emergency rendering are still active. Kept here for context — read
+`JOURNAL.md` entries 11-13 for why the LLM-correction layer was
+removed.
 
 ### Layer 1: Raw Audio Capture
 Continuous microphone stream with NO preprocessing by browser speech APIs. The Web Speech API is explicitly bypassed because it applies noise cancellation and speech normalization that destroys the distortion signals the system needs to learn. Raw PCM audio at 16kHz+ with Voice Activity Detection to segment speech from silence.
@@ -52,15 +138,33 @@ Map audio features to what the patient actually produced — not what they meant
 ### Layer 4: Patient Distortion Model
 The learned map of this specific patient's speech impediment patterns. Includes a phoneme confusion matrix (P(intended | produced)), positional rules (distortions differ word-initial vs. word-final), consonant cluster simplification patterns, syllable deletion tendencies, fatigue curves, and compensatory strategies the patient develops over time.
 
-### Layer 5: LLM Contextual Correction
+### Layer 5: LLM Contextual Correction *(REMOVED from live path)*
+> **Status (2026-05):** This layer was removed after empirical eval
+> showed it consistently lost to naive Whisper across every speaker
+> and severity. See `JOURNAL.md` entries 11-13. Replaced by Whisper +
+> phoneme-alignment safety gate.
+
 The LLM receives phoneme probability sequences, the patient's distortion profile, conversational context, and situational context. It applies constrained beam search to generate multiple candidate sentences, scoring each against all available signals, and outputs the top interpretations with per-word confidence scores.
 
 ### Layer 6: Translation Display
-Real-time display of translated speech on a screen facing the listener. Includes confidence indicators per phrase, alternative interpretations when confidence is low, tap-to-confirm feedback for continuous learning, and emergency phrase detection for pain/distress signals.
+Real-time display of translated speech on a screen facing the
+listener. Includes confidence indicators per phrase, tap-to-confirm
+feedback for continuous learning, and emergency phrase detection for
+pain/distress signals. The current implementation also adds a red
+ring + "uncertain" hint for outputs the phoneme-alignment gate flagged
+as unsupported by the audio.
 
 ---
 
-## LLM Layer — Feature Specification
+## LLM Layer — Feature Specification *(historical — original design)*
+
+> **Status (2026-05):** The architecture below describes how the LLM
+> correction layer was *intended* to work. It was implemented and
+> measured; the result was that it consistently lost to naive Whisper
+> on patient and control speech alike. The empirical evidence is in
+> `JOURNAL.md`. The Sonnet calibration-analysis pass remains for
+> generating diagnostic insights from calibration data, but this
+> layer is no longer in the live translation pipeline.
 
 ### Inputs (What the LLM Receives)
 
