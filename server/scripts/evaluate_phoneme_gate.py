@@ -40,6 +40,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import _ensure_espeak_library  # noqa: F401
+from app.alignment import alignment_score, forced_align, text_to_phonemes  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import connect, list_torgo_clips  # noqa: E402
 from app.phonemes import PhonemeExtractor  # noqa: E402
@@ -82,6 +83,75 @@ def _categorize(wer: float, flagged: bool) -> str:
     return "AMB"
 
 
+def compute_speaker_threshold(
+    extractor: PhonemeExtractor,
+    transcriber: Transcriber,
+    token_to_id: dict[str, int],
+    blank_id: int,
+    cal_clips: list[dict],
+    global_threshold: float,
+    *,
+    max_wer_for_corpus: float = 0.3,
+    percentile: float = 5.0,
+    min_samples: int = 5,
+    floor: float = -3.0,
+) -> float | None:
+    """Estimate this speaker's gate threshold from their cal split.
+
+    For each cal clip, run Whisper, keep only clips where Whisper's WER
+    against the intended text is low (<= ``max_wer_for_corpus``), then
+    score Whisper's text against the audio's phoneme distribution. The
+    resulting list of alignment scores is "what does this speaker's
+    *correctly transcribed* output normally look like." Anything below
+    the requested percentile is unusually bad even allowing for the
+    speaker's natural distribution — that's the threshold.
+
+    The result is clamped to ``[floor, global_threshold]`` — i.e. the
+    adaptive threshold can only *loosen* the gate (lower threshold,
+    more permissive), never tighten it past the global default. This
+    is critical: control speakers have naturally tight alignment
+    scores so a percentile-derived threshold would land far above the
+    global default and produce false positives. Adaptive thresholds
+    should only help when the speaker's natural distribution is below
+    the global default (i.e. dysarthria).
+
+    Returns None when there aren't enough samples to estimate.
+    """
+    scores: list[float] = []
+    for clip in cal_clips:
+        text = (clip.get("intended_text") or "").strip()
+        if not text:
+            continue
+        audio = _load_audio(clip["wav_path"])
+        if audio is None or audio.size == 0:
+            continue
+        whisper_text = transcriber.transcribe(audio).strip()
+        if not whisper_text:
+            continue
+        ref_words = normalize_words(text)
+        hyp_words = normalize_words(whisper_text)
+        if not ref_words:
+            continue
+        wer = levenshtein(ref_words, hyp_words) / len(ref_words)
+        if wer > max_wer_for_corpus:
+            continue
+        whisper_phonemes = text_to_phonemes(whisper_text)
+        if not whisper_phonemes:
+            continue
+        probs = extractor.extract(audio, settings.sample_rate)
+        log_probs = np.log(np.clip(probs, 1e-12, 1.0))
+        aligned = forced_align(log_probs, whisper_phonemes, token_to_id, blank_id)
+        score = alignment_score(aligned)
+        if score == float("-inf"):
+            continue
+        scores.append(score)
+
+    if len(scores) < min_samples:
+        return None
+    threshold = float(np.percentile(scores, percentile))
+    return max(floor, min(global_threshold, threshold))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--speakers", default="F03,M01")
@@ -114,6 +184,20 @@ def main() -> int:
         action="store_true",
         help="Print every clip's row in addition to the summary.",
     )
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="Compute per-speaker alignment thresholds from the cal split "
+        "(5th percentile of Whisper-correct alignment scores) instead of "
+        "using the global --min-align. Falls back to global for speakers "
+        "with too few cal samples.",
+    )
+    parser.add_argument(
+        "--max-cal-clips",
+        type=int,
+        default=80,
+        help="Cap cal-split clips used for threshold estimation per speaker.",
+    )
     args = parser.parse_args()
 
     extractor = PhonemeExtractor(settings.phoneme_model_name, device=settings.device)
@@ -140,16 +224,49 @@ def main() -> int:
     rows: list[GateRow] = []
     started = time.monotonic()
 
+    threshold_per_speaker: dict[str, float] = {}
     for spk in speakers:
-        clips = list_torgo_clips(conn, speaker_id=spk, limit=1_000_000)
+        all_clips = list_torgo_clips(conn, speaker_id=spk, limit=1_000_000)
         if not args.include_non_word:
-            clips = [c for c in clips if c.get("prompt_set") != "non-word"]
-        clips = filter_by_split(clips, args.split)
+            all_clips = [c for c in all_clips if c.get("prompt_set") != "non-word"]
+
+        if args.adaptive:
+            cal_clips = filter_by_split(all_clips, "cal")[: args.max_cal_clips]
+            t = compute_speaker_threshold(
+                extractor, transcriber, token_to_id, blank_id, cal_clips,
+                global_threshold=args.min_align,
+            )
+            if t is None:
+                print(f"[adaptive] {spk}: insufficient cal samples — using global {args.min_align}")
+                t = args.min_align
+            elif t == args.min_align:
+                print(f"[adaptive] {spk}: keeping global {args.min_align} (speaker's natural scores are already above)")
+            else:
+                print(f"[adaptive] {spk}: threshold = {t:.2f} (loosened from {args.min_align})")
+            threshold_per_speaker[spk] = t
+
+        clips = filter_by_split(all_clips, args.split)
         if args.limit:
             clips = clips[: args.limit]
         if not clips:
             print(f"[skip] {spk}: no clips after filters")
             continue
+
+        # Build a fresh gate per speaker when adaptive — the threshold
+        # is the only stateful field that changes; everything else is
+        # shared state safe across speakers.
+        if args.adaptive:
+            speaker_gate = GatedTranscriber(
+                transcriber=transcriber,
+                extractor=extractor,
+                token_to_id=token_to_id,
+                blank_id=blank_id,
+                sample_rate=settings.sample_rate,
+                min_alignment_score=threshold_per_speaker[spk],
+                max_phoneme_density=args.max_density,
+            )
+        else:
+            speaker_gate = gate
 
         for clip in clips:
             text = (clip.get("intended_text") or "").strip()
@@ -159,7 +276,7 @@ def main() -> int:
             if audio is None or audio.size == 0:
                 continue
 
-            gated = gate.transcribe_with_gate(audio)
+            gated = speaker_gate.transcribe_with_gate(audio)
             ref_words = normalize_words(text)
             hyp_words = normalize_words(gated.text)
             wer = levenshtein(ref_words, hyp_words) / max(len(ref_words), 1)
