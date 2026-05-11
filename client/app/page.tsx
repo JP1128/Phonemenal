@@ -41,6 +41,10 @@ type Translated = {
   overallConfidence: number;
   emergency: boolean;
   contextHints: string[];
+  // Phoneme-alignment safety gate. Flagged means Whisper produced text the
+  // wav2vec2 phoneme distribution doesn't support (likely hallucination).
+  flagged: boolean;
+  flagReason: string | null;
   feedback?: "confirmed" | "corrected";
   correctedText?: string;
   arrivedAt: number;
@@ -157,6 +161,8 @@ export default function HomePage() {
         overallConfidence: msg.overall_confidence,
         emergency: msg.emergency,
         contextHints: msg.context_hints,
+        flagged: msg.flagged ?? false,
+        flagReason: msg.reason ?? null,
         arrivedAt: performance.now(),
       };
       const existing = prev.findIndex((r) => r.utteranceId === row.utteranceId);
@@ -568,17 +574,36 @@ function ActiveDisplay({
       <div className="text-center space-y-4">
         <SpeakerBadge speaker={row.speaker} />
         {!editing ? (
+          // When the phoneme-alignment gate flags this clip, frame the text
+          // in a red ring + below-text hint. The text stays visible because
+          // hiding it would defeat the medical-safety story (the listener
+          // needs to see the candidate to judge it), but the visual treatment
+          // makes it clear the system isn't standing behind the words.
           <div
-            className="leading-snug font-medium flex flex-wrap justify-center gap-x-3 gap-y-2"
-            style={{ fontSize: "calc(var(--phonemer-base-size) * 2.6)" }}
+            className={
+              row.flagged
+                ? "rounded-2xl px-6 py-5 ring-2 ring-rose-500/80 bg-rose-950/15"
+                : ""
+            }
           >
-            {words.map((w, i) => (
-              <ShadedWord
-                key={i}
-                word={w}
-                conf={row.perWordConfidence[i] ?? row.overallConfidence}
-              />
-            ))}
+            <div
+              className="leading-snug font-medium flex flex-wrap justify-center gap-x-3 gap-y-2"
+              style={{ fontSize: "calc(var(--phonemer-base-size) * 2.6)" }}
+            >
+              {words.map((w, i) => (
+                <ShadedWord
+                  key={i}
+                  word={w}
+                  conf={row.perWordConfidence[i] ?? row.overallConfidence}
+                />
+              ))}
+            </div>
+            {row.flagged && (
+              <div className="mt-3 text-xs text-rose-300/90 tracking-wide uppercase">
+                uncertain — phoneme alignment doesn&apos;t support this
+                {row.flagReason ? ` (${row.flagReason.replace("_", " ")})` : ""}
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-3">
@@ -719,7 +744,15 @@ function SpeakerBadge({ speaker }: { speaker: string }) {
 
 function HistoryRow({ row }: { row: Translated }) {
   const c = row.overallConfidence;
-  const tone = c >= 0.8 ? "#34d399" : c >= 0.5 ? "#fbbf24" : "#fb7185";
+  // Flagged rows always render with the rose tone regardless of confidence
+  // — the gate's binary verdict is the dominant signal.
+  const tone = row.flagged
+    ? "#fb7185"
+    : c >= 0.8
+      ? "#34d399"
+      : c >= 0.5
+        ? "#fbbf24"
+        : "#fb7185";
   return (
     <li
       className="text-xs"
@@ -729,6 +762,11 @@ function HistoryRow({ row }: { row: Translated }) {
         <span className="opacity-50 font-mono shrink-0 tabular-nums">
           {(c * 100).toFixed(0)}%
         </span>
+        {row.flagged && (
+          <span className="text-[9px] uppercase tracking-wider ml-1 text-rose-400/90 shrink-0">
+            uncertain
+          </span>
+        )}
         {row.feedback && (
           <span
             className="text-[9px] uppercase tracking-wider ml-auto opacity-70 shrink-0"

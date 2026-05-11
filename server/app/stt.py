@@ -98,7 +98,15 @@ class GatedTranscriber:
         self._min_alignment = min_alignment_score
         self._max_density = max_phoneme_density
 
-    def transcribe_with_gate(self, audio: np.ndarray) -> GatedTranscription:
+    def transcribe_with_gate(
+        self,
+        audio: np.ndarray,
+        probs: np.ndarray | None = None,
+    ) -> GatedTranscription:
+        """Run Whisper + alignment gate. ``probs`` may be pre-computed
+        wav2vec2 softmax output to avoid duplicating extraction work
+        when the caller already ran the phoneme model.
+        """
         from .alignment import alignment_score, forced_align, text_to_phonemes
 
         text = self._transcriber.transcribe(audio).strip()
@@ -118,7 +126,8 @@ class GatedTranscriber:
         duration_s = max(audio.size / self._sample_rate, 1e-3)
         density = len(phonemes) / duration_s
 
-        probs = self._extractor.extract(audio, self._sample_rate)
+        if probs is None:
+            probs = self._extractor.extract(audio, self._sample_rate)
         log_probs = np.log(np.clip(probs, 1e-12, 1.0))
         aligned = forced_align(
             log_probs, phonemes, self._token_to_id, self._blank_id

@@ -63,6 +63,15 @@ export type TranslationMessage = {
   overall_confidence: number;
   emergency: boolean;
   context_hints: string[];
+  // Phoneme-alignment safety gate fields. The patient pipeline now uses
+  // Whisper + a wav2vec2-alignment check; `flagged` is true when the audio
+  // doesn't support the proposed transcription (Whisper-style hallucination).
+  // The UI renders flagged outputs with a red border + "uncertain" hint
+  // — text stays visible, but it isn't presented as confidently correct.
+  flagged?: boolean;
+  reason?: "low_alignment" | "phoneme_density" | null;
+  align_score?: number;
+  phoneme_density?: number;
 };
 
 export type TranslationErrorMessage = {

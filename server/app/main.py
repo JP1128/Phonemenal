@@ -51,11 +51,10 @@ from .db import (
 )
 from .distortion import build_profile
 from .emergency import check_prosody, check_text
-from .llm import TranslationContext, summarize_profile_for_prompt
 from .phonemes import FRAME_STRIDE_SAMPLES, PhonemeExtractor
 from .silero_vad import make_vad
 from .speaker_id import SpeakerIdentifier, ensure_schema
-from .stt import Transcriber
+from .stt import GatedTranscriber, Transcriber
 from .vad import Utterance, UtteranceSegmenter
 
 logger = logging.getLogger("phonemer")
@@ -95,6 +94,20 @@ async def lifespan(app: FastAPI):
         model_size=settings.stt_model_size,
         compute_type=settings.stt_compute_type,
         device=settings.device,
+    )
+
+    # Gated transcriber: Whisper + phoneme-alignment safety gate. This is
+    # the patient translation path now that empirical evidence (see
+    # JOURNAL.md entries 12-13) showed the calibrated LLM layer can't beat
+    # naive Whisper. The gate flags suspected hallucinations so the UI
+    # can render them as low-trust rather than confidently surfacing
+    # made-up content.
+    app.state.gate = GatedTranscriber(
+        transcriber=app.state.transcriber,
+        extractor=app.state.extractor,
+        token_to_id=app.state.extractor.processor.tokenizer.get_vocab(),
+        blank_id=app.state.extractor.processor.tokenizer.pad_token_id or 0,
+        sample_rate=settings.sample_rate,
     )
 
     app.state.db = connect(settings.db_path)
@@ -671,6 +684,7 @@ async def ws_audio(websocket: WebSocket) -> None:
     extractor: PhonemeExtractor = websocket.app.state.extractor
     speaker_id: SpeakerIdentifier = websocket.app.state.speaker
     transcriber: Transcriber = websocket.app.state.transcriber
+    gate: GatedTranscriber = websocket.app.state.gate
     db = websocket.app.state.db
 
     session_id = create_session(db)
@@ -762,7 +776,7 @@ async def ws_audio(websocket: WebSocket) -> None:
 
         if is_patient:
             await _process_patient(
-                websocket, loop, extractor, db, context, session_id, utt_id, utt, frame_stride_ms
+                websocket, loop, extractor, gate, db, context, session_id, utt_id, utt, frame_stride_ms
             )
         else:
             await _process_other(websocket, loop, transcriber, db, context, session_id, utt_id, utt)
@@ -839,6 +853,7 @@ async def _process_patient(
     websocket: WebSocket,
     loop: asyncio.AbstractEventLoop,
     extractor: PhonemeExtractor,
+    gate: GatedTranscriber,
     db,
     context: ContextManager,
     session_id: int,
@@ -908,19 +923,18 @@ async def _process_patient(
             )
         )
 
-    # Layer 5 — LLM translation. Skipped if no Anthropic API key is configured;
-    # /debug still works as a phoneme inspector.
-    if not llm.is_configured():
-        return
+    # Layer 5 — Whisper + phoneme-alignment safety gate.
+    # See JOURNAL.md entries 12-13 for why this replaces the calibrated LLM
+    # path: empirical eval showed the LLM correction layer can't beat naive
+    # Whisper, but the phoneme distribution does reliably catch Whisper's
+    # hallucination failure mode. We surface Whisper's text and flag clips
+    # where alignment evidence doesn't support it.
     try:
-        await _translate_and_emit(
-            websocket, loop, db, context, session_id, utterance_id, response_frames
+        await _gate_and_emit(
+            websocket, loop, gate, db, context, session_id, utterance_id, utt, probs,
         )
     except Exception as e:
-        logger.exception("translation failed for utt=%s", utterance_id)
-        # Surface the failure to the client so the UI can show why no
-        # translation arrived (most often: invalid API key, no credits,
-        # or rate-limit). Without this the page just hangs forever.
+        logger.exception("gated transcription failed for utt=%s", utterance_id)
         try:
             await websocket.send_text(
                 json.dumps(
@@ -936,50 +950,47 @@ async def _process_patient(
             pass
 
 
-async def _translate_and_emit(
+async def _gate_and_emit(
     websocket: WebSocket,
     loop: asyncio.AbstractEventLoop,
+    gate: GatedTranscriber,
     db,
     context_mgr: ContextManager,
     session_id: int,
     utterance_id: int,
-    phoneme_frames: list[dict],
+    utt: Utterance,
+    probs: np.ndarray,
 ) -> None:
-    profile_summary = _profile_summary_for(db)
-    ctx_dict = context_mgr.assemble_for_llm()
-    translation_ctx = TranslationContext(
-        phoneme_frames=phoneme_frames,
-        recent_utterances=ctx_dict["recent_utterances"],
-        active_topics=ctx_dict["active_topics"],
-        pending_questions=ctx_dict["pending_questions"],
-        fatigue_phase=ctx_dict["emotion"].get("phase"),
-        setting=ctx_dict["session"].get("setting"),
-        listener_role=ctx_dict["session"].get("listener_role_hint"),
+    """Run Whisper + phoneme-alignment gate, persist, emit to client.
+
+    The gate emits a ``translation`` message whose new ``flagged`` field
+    drives the listener UI: red border + low-trust hint when the audio
+    doesn't support what Whisper proposed. The text is always surfaced
+    — hiding it would defeat the medical-safety story.
+    """
+    gated = await loop.run_in_executor(
+        None, lambda: gate.transcribe_with_gate(utt.audio, probs=probs)
     )
-    result = await loop.run_in_executor(
-        None,
-        lambda: llm.translate(
-            model=settings.translation_model,
-            profile_summary=profile_summary,
-            context=translation_ctx,
-            max_tokens=settings.translation_max_tokens,
-        ),
-    )
+    # Map the gate's binary verdict into the existing per-translation
+    # confidence range so downstream UI rendering keeps working.
+    overall_conf = 0.25 if gated.flagged else 0.85
     write_translation(
         db,
         utterance_id=utterance_id,
-        primary=result.primary,
-        alternatives=result.alternatives,
-        per_word_confidence=result.per_word_confidence,
-        overall_confidence=result.overall_confidence,
-        emergency=result.emergency,
-        context_hints=result.context_hints,
-        model=settings.translation_model,
+        primary=gated.text,
+        alternatives=[],
+        per_word_confidence=[],
+        overall_confidence=overall_conf,
+        emergency=False,
+        context_hints=[
+            f"flagged: {gated.reason}" if gated.reason else "phoneme-aligned"
+        ],
+        model="whisper+phoneme-gate",
         usage={
-            "cache_read_tokens": result.cache_read_tokens,
-            "cache_creation_tokens": result.cache_creation_tokens,
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
         },
     )
     await websocket.send_text(
@@ -987,66 +998,48 @@ async def _translate_and_emit(
             {
                 "type": "translation",
                 "utterance_id": utterance_id,
-                "primary": result.primary,
-                "alternatives": result.alternatives,
-                "per_word_confidence": result.per_word_confidence,
-                "overall_confidence": result.overall_confidence,
-                "emergency": result.emergency,
-                "context_hints": result.context_hints,
+                "primary": gated.text,
+                "alternatives": [],
+                "per_word_confidence": [],
+                "overall_confidence": overall_conf,
+                "emergency": False,
+                "context_hints": [],
+                # New gate-specific fields. Frontend renders red border on flagged.
+                "flagged": gated.flagged,
+                "reason": gated.reason,
+                "align_score": gated.align_score,
+                "phoneme_density": gated.phoneme_density,
             }
         )
     )
 
-    # Feed the patient's translation back into the context window.
-    context_mgr.observe_patient(result.primary)
+    # Only feed un-flagged text into the conversational context window.
+    # A flagged transcription is by definition untrusted; we shouldn't
+    # let it bias the topic tracker or pending-question matching.
+    if not gated.flagged and gated.text:
+        context_mgr.observe_patient(gated.text)
 
-    # Layer-6 emergency cross-check on text — fires even when the LLM
-    # didn't flag it, since priority terms get a lower threshold.
+    # Layer-6 emergency cross-check on text. Priority terms (pain, help,
+    # can't breathe) get a lower threshold and fire even when flagged —
+    # missed emergencies are worse than false alarms.
     text_alert = check_text(
-        primary=result.primary,
-        alternatives=result.alternatives,
-        overall_confidence=result.overall_confidence,
+        primary=gated.text,
+        alternatives=[],
+        overall_confidence=overall_conf,
     )
-    if result.emergency or text_alert.triggered:
+    if text_alert.triggered:
         await websocket.send_text(
             json.dumps(
                 {
                     "type": "emergency",
                     "utterance_id": utterance_id,
-                    "phrase": result.primary,
-                    "confidence": max(
-                        result.overall_confidence,
-                        text_alert.confidence,
-                    ),
-                    "category": text_alert.category or "llm_flagged",
-                    "sources": text_alert.sources or ["llm"],
+                    "phrase": gated.text,
+                    "confidence": text_alert.confidence,
+                    "category": text_alert.category or "text",
+                    "sources": text_alert.sources or ["text"],
                 }
             )
         )
-
-
-def _profile_summary_for(db) -> str:
-    """Effective profile (baseline + EMA-decayed online observations) plus
-    the personal vocabulary block. Empty string when no calibration exists."""
-    cal_id = _latest_calibration_id(db)
-    parts: list[str] = []
-    eff = adapt_mod.effective_profile_summary(db, cal_id)
-    if eff is None:
-        cur = db.execute(
-            "SELECT profile_json FROM patient_profiles ORDER BY id DESC LIMIT 1"
-        )
-        row = cur.fetchone()
-        if row:
-            try:
-                parts.append(summarize_profile_for_prompt(json.loads(row[0])))
-            except Exception:
-                pass
-    else:
-        parts.append(eff)
-    vocab_block = vocab_mod.vocabulary_prompt_block(db)
-    if vocab_block:
-        parts.append("\n" + vocab_block)
-    return "\n".join(parts)
 
 
 def _recent_for_context(db, session_id: int) -> list[dict]:
