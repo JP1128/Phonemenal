@@ -843,7 +843,7 @@ function RevealedWord({
         className="text-2xl"
         style={{
           color,
-          textDecoration: word.corrected ? "underline" : "none",
+          textDecorationLine: word.corrected ? "underline" : "none",
           textDecorationColor: `${color}88`,
           textUnderlineOffset: 5,
           fontWeight: 500,

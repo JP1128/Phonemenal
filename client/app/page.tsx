@@ -696,13 +696,15 @@ function ActiveDisplay({
 
 function ShadedWord({ word, conf }: { word: string; conf: number }) {
   const color = conf >= 0.8 ? "#e5e7eb" : conf >= 0.5 ? "#fbbf24" : "#fb7185";
-  const decoration = conf < 0.5 ? "underline" : "none";
+  // Use longhand textDecorationLine instead of the shorthand textDecoration
+  // so React doesn't warn about mixing shorthand + textDecorationColor.
+  const decorationLine = conf < 0.5 ? "underline" : "none";
   return (
     <span
       title={`${(conf * 100).toFixed(0)}% confidence`}
       style={{
         color,
-        textDecoration: decoration,
+        textDecorationLine: decorationLine,
         textUnderlineOffset: 6,
         textDecorationColor: "rgba(251, 113, 133, 0.5)",
       }}
