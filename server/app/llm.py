@@ -129,6 +129,15 @@ _SYSTEM_PREFIX = (
     "context.\n\n"
     "Your job: infer what the patient INTENDED to say and submit ranked "
     "candidates via the `submit_translation` tool.\n\n"
+    "Phoneme stream format:\n"
+    "  - One row per 20 ms frame, ordered by timestamp, listing the top "
+    "non-blank phonemes with their probabilities.\n"
+    "  - Lines like `| --- pause 320ms --- |` mark sustained silence "
+    "(CTC blank dominant for ≥ 80 ms). Treat each such marker as a WORD "
+    "BOUNDARY: phonemes between two pause markers belong to ONE word.\n"
+    "  - The whole utterance is one short patient phrase; do not invent "
+    "extra words across pause boundaries unless phonemes between them "
+    "clearly support multiple words.\n\n"
     "Hard rules:\n"
     "  - Context is a prior, never a constraint. At least 2 of your 3 "
     "    alternatives MUST ignore active topics and pending questions.\n"
@@ -143,6 +152,9 @@ _SYSTEM_PREFIX = (
     "    matrices in the direction P(produced | intended).\n"
     "  - Keep `primary` to a short, natural English sentence. Single words and "
     "    fragments are fine when that's all the patient produced.\n"
+    "  - When phonemes between two pause markers form a single recognizable "
+    "    word, output that one word — do not split it into two by guessing "
+    "    word boundaries that aren't in the silence stream.\n"
 )
 
 
@@ -374,14 +386,58 @@ def _format_user_block(ctx: TranslationContext) -> str:
     return "\n".join(out)
 
 
+_BLANK_TOKEN = "<pad>"
+_BLANK_DOMINANT_PROB = 0.7   # top-1 prob above this counts the frame as silence
+_BOUNDARY_MIN_MS = 80        # pause runs shorter than this aren't word boundaries
+
+
 def _format_phoneme_frames(frames: list[dict]) -> str:
-    """Compact representation: one frame per line, top-3 only, prob to 2 dp."""
+    """Compact representation with explicit word-boundary markers.
+
+    Sustained blank-dominated frames (top-1 = ``<pad>`` with prob ≥ 0.7,
+    persisting ≥ 80 ms) are collapsed into a single ``| pause Nms |`` line
+    instead of being emitted frame-by-frame. Without this signal Sonnet
+    has no way to tell where one word ends and the next begins — it
+    gets a flat phoneme stream and frequently mis-segments syllables
+    across word boundaries (``shoot`` → ``she it``, ``always answers``
+    → ``also ways and bans``). The boundary marker is the only
+    word-structure signal the LLM gets per utterance.
+    """
     lines: list[str] = []
+    silence_start_ms: int | None = None
+
+    def _flush_pause(end_ms: int) -> None:
+        nonlocal silence_start_ms
+        if silence_start_ms is None:
+            return
+        duration = end_ms - silence_start_ms
+        if duration >= _BOUNDARY_MIN_MS:
+            lines.append(f"  | --- pause {duration}ms --- |")
+        silence_start_ms = None
+
     for f in frames[:200]:  # cap at 200 frames (~4 s) per request
         ts = f.get("timestamp_ms", 0)
-        phs = f.get("phonemes", [])[:3]
-        chunk = " ".join(f"{p['symbol']}:{p['prob']:.2f}" for p in phs)
+        phs = f.get("phonemes", []) or []
+        is_blank = bool(
+            phs
+            and phs[0].get("symbol") == _BLANK_TOKEN
+            and phs[0].get("prob", 0.0) >= _BLANK_DOMINANT_PROB
+        )
+        if is_blank:
+            if silence_start_ms is None:
+                silence_start_ms = ts
+            continue
+
+        _flush_pause(ts)
+        non_blank = [p for p in phs if p.get("symbol") != _BLANK_TOKEN][:3]
+        chunk = " ".join(f"{p['symbol']}:{p['prob']:.2f}" for p in non_blank)
         lines.append(f"  {ts:>5}ms  {chunk}")
+
+    # Trailing silence — useful as a "the utterance ended here" cue.
+    if silence_start_ms is not None and frames:
+        last_ts = frames[min(len(frames), 200) - 1].get("timestamp_ms", silence_start_ms)
+        _flush_pause(last_ts)
+
     if len(frames) > 200:
         lines.append(f"  …({len(frames) - 200} more frames truncated)")
     return "\n".join(lines)
