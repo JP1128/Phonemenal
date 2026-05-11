@@ -968,8 +968,19 @@ async def _gate_and_emit(
     doesn't support what Whisper proposed. The text is always surfaced
     — hiding it would defeat the medical-safety story.
     """
+    # Build the conversational/vocabulary prior for Whisper. Recent
+    # listener turn + active topics + caregiver-supplied personal vocab
+    # (family names, medications) get fed in as initial_prompt so
+    # Whisper has *some* context for borderline calls. This is the
+    # well-validated ASR-conditioning pattern, not the failed
+    # phoneme-correction architecture.
+    vocab_text = vocab_mod.vocabulary_prompt_block(db)
+    initial_prompt = context_mgr.whisper_prompt(vocab_text=vocab_text)
     gated = await loop.run_in_executor(
-        None, lambda: gate.transcribe_with_gate(utt.audio, probs=probs)
+        None,
+        lambda: gate.transcribe_with_gate(
+            utt.audio, probs=probs, initial_prompt=initial_prompt,
+        ),
     )
     # Map the gate's binary verdict into the existing per-translation
     # confidence range so downstream UI rendering keeps working.

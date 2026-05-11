@@ -471,6 +471,58 @@ class ContextManager:
                 "session": self.metadata.to_dict(),
             }
 
+    def whisper_prompt(self, max_chars: int = 220, vocab_text: str = "") -> str:
+        """Assemble a short ``initial_prompt`` string for faster-whisper.
+
+        Whisper accepts a free-form text prior that biases what it expects
+        to hear next. We feed it the most recent listener turn (verbatim,
+        natural language), the active topic keywords, and any
+        caregiver-supplied personal vocabulary (family names, medications).
+        Kept compact — Whisper's prompt budget is small and longer strings
+        can pull the model into reproducing the prompt instead of
+        transcribing.
+
+        ``vocab_text`` is the personal-vocab block from
+        ``vocabulary_prompt_block(db)``; empty when no terms are saved.
+        """
+        with self._lock:
+            chunks: list[str] = []
+
+            # Last non-patient utterance gives Whisper the conversational
+            # backdrop. Patient turns are what we're transcribing now,
+            # so we don't include them — Whisper might echo them back.
+            recent = self.utterance_log.recent()
+            for u in reversed(recent):
+                if not u.is_patient and u.text:
+                    chunks.append(u.text.strip())
+                    break
+
+            topics = [t["keyword"] for t in self.topics.active(k=6)]
+            if topics:
+                chunks.append("topics: " + ", ".join(topics))
+
+            # Personal-vocab block from the DB-backed list. We only feed
+            # the bare term tokens to Whisper, no boost numbers or kind
+            # labels — those would just be noise to the ASR.
+            if vocab_text:
+                terms: list[str] = []
+                for line in vocab_text.splitlines():
+                    line = line.strip()
+                    if not line or ":" not in line:
+                        continue
+                    _, _, after = line.partition(":")
+                    for raw in after.split(","):
+                        term = raw.strip().split(" (boost")[0]
+                        if term:
+                            terms.append(term)
+                if terms:
+                    chunks.append("vocabulary: " + ", ".join(terms[:24]))
+
+        prompt = " | ".join(chunks)
+        if len(prompt) > max_chars:
+            prompt = prompt[: max_chars - 1] + "…"
+        return prompt
+
     def snapshot_for_ui(self) -> dict:
         """Identical structure returned to the debug panel — no truncation."""
         with self._lock:

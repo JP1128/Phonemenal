@@ -37,16 +37,26 @@ class Transcriber:
             compute_type=self._compute_type,
         )
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def transcribe(self, audio: np.ndarray, initial_prompt: str = "") -> str:
+        """Transcribe audio. ``initial_prompt`` (optional) is fed to
+        faster-whisper as conversational context — recent listener turns,
+        active topics, patient personal vocabulary. Whisper uses it as a
+        soft prior on what to expect; doesn't override clear acoustic
+        evidence but biases borderline calls."""
         if audio.size == 0:
             return ""
         with self._lock:
             self._ensure_loaded()
-            segments, _info = self._model.transcribe(
-                audio.astype(np.float32, copy=False),
+            kwargs: dict = dict(
                 language="en",
                 vad_filter=False,
                 beam_size=1,
+            )
+            if initial_prompt:
+                kwargs["initial_prompt"] = initial_prompt
+            segments, _info = self._model.transcribe(
+                audio.astype(np.float32, copy=False),
+                **kwargs,
             )
             return " ".join(s.text.strip() for s in segments).strip()
 
@@ -114,14 +124,17 @@ class GatedTranscriber:
         self,
         audio: np.ndarray,
         probs: np.ndarray | None = None,
+        initial_prompt: str = "",
     ) -> GatedTranscription:
         """Run Whisper + alignment gate. ``probs`` may be pre-computed
         wav2vec2 softmax output to avoid duplicating extraction work
-        when the caller already ran the phoneme model.
+        when the caller already ran the phoneme model. ``initial_prompt``
+        is passed through to Whisper as conversational/vocabulary
+        context.
         """
         from .alignment import alignment_score, forced_align, text_to_phonemes
 
-        text = self._transcriber.transcribe(audio).strip()
+        text = self._transcriber.transcribe(audio, initial_prompt=initial_prompt).strip()
         if not text or audio.size == 0:
             return GatedTranscription(
                 text=text, align_score=0.0, phoneme_density=0.0,
