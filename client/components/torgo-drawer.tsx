@@ -15,6 +15,7 @@ type TorgoClip = {
   speaker_id: string;
   condition: string;
   intelligibility: string | null;
+  prompt_set: string | null;
   intended_text: string | null;
   duration_ms: number;
 };
@@ -25,6 +26,19 @@ const GROUPS = [
   { key: "M_Con", label: "M · Control", gender: "M", condition: "control" },
   { key: "M_Dys", label: "M · Dys", gender: "M", condition: "dysarthria" },
 ] as const;
+
+// prompt_set values written by the loader. "non-word" is the DDK-stimuli
+// bucket — single repeated CV syllables ("papa", "kakaka") that aren't
+// useful for translation testing; hidden by default.
+type PromptSet = "timit" | "intelligibility" | "image" | "non-word" | "unknown";
+
+const PROMPT_SET_LABELS: Record<PromptSet, string> = {
+  timit: "sentence",
+  intelligibility: "word",
+  image: "image",
+  "non-word": "non-word",
+  unknown: "?",
+};
 
 export type TorgoDrawerProps = {
   open: boolean;
@@ -57,12 +71,19 @@ export function TorgoDrawer({
   const [speaker, setSpeaker] = useState<string | null>(null);
   const [streamingId, setStreamingId] = useState<number | null>(null);
   const [playingId, setPlayingId] = useState<number | null>(null);
+  const [showNonWord, setShowNonWord] = useState(false);
+  const [setFilter, setSetFilter] = useState<"all" | "timit" | "intelligibility">(
+    "all",
+  );
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
     if (clips !== null) return;
-    fetch(`${SERVER_HTTP}/torgo/clips?limit=2000`)
+    // Limit needs to comfortably exceed the full HF-loaded manifest
+    // (~8,700 clips). 2,000 was truncating the alphabetical fetch
+    // before reaching M speakers, hiding them from the panel entirely.
+    fetch(`${SERVER_HTTP}/torgo/clips?limit=20000`)
       .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
       .then((data) => setClips(data.clips ?? []))
       .catch((err) => setError(`could not load TORGO clips: ${err}`));
@@ -75,9 +96,11 @@ export function TorgoDrawer({
     return clips.filter(
       (c) =>
         c.condition === grp.condition &&
-        c.speaker_id.toUpperCase().startsWith(grp.gender),
+        c.speaker_id.toUpperCase().startsWith(grp.gender) &&
+        (showNonWord || c.prompt_set !== "non-word") &&
+        (setFilter === "all" || c.prompt_set === setFilter),
     );
-  }, [clips, groupKey]);
+  }, [clips, groupKey, showNonWord, setFilter]);
 
   const speakers = useMemo(() => {
     const set = new Set<string>();
@@ -182,7 +205,9 @@ export function TorgoDrawer({
       <header className="px-4 py-3 border-b border-white/10 flex items-center gap-2">
         <h2 className="text-sm font-semibold tracking-wide">TORGO</h2>
         <span className="text-[10px] opacity-50 font-mono">
-          {clips?.length ?? "…"} clips
+          {clips
+            ? `${groupClips.length} / ${clips.length} clips`
+            : "… clips"}
         </span>
         <button
           onClick={onClose}
@@ -249,6 +274,42 @@ export function TorgoDrawer({
         </div>
       </div>
 
+      <div className="px-4 py-3 border-b border-white/10 space-y-2">
+        <div className="text-[9px] tracking-[0.25em] font-mono opacity-50">
+          PROMPT TYPE
+        </div>
+        <div className="flex gap-1">
+          {(
+            [
+              ["all", "all"],
+              ["timit", "sentences"],
+              ["intelligibility", "single words"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setSetFilter(key)}
+              className={`text-[11px] px-2 py-1 rounded ${
+                setFilter === key
+                  ? "border border-teal-400/60 bg-teal-400/10 text-teal-200"
+                  : "border border-white/10 hover:bg-white/5"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <label className="flex items-center gap-2 text-[10px] opacity-70">
+          <input
+            type="checkbox"
+            checked={showNonWord}
+            onChange={(e) => setShowNonWord(e.target.checked)}
+            className="accent-teal-400"
+          />
+          show non-word DDK clips (papa, kakaka — not useful for translation)
+        </label>
+      </div>
+
       <div className="flex-1 overflow-y-auto px-2 py-2">
         <div className="text-[9px] tracking-[0.25em] font-mono opacity-50 px-2 mb-1">
           CLIPS ({speakerClips.length})
@@ -283,19 +344,36 @@ export function TorgoDrawer({
               <button
                 onClick={() => streamClip(c)}
                 disabled={streamingId !== null}
-                className={`flex-1 text-left text-xs px-2 py-1.5 rounded-r transition-colors ${
+                className={`flex-1 text-left text-xs px-2 py-1.5 rounded-r transition-colors min-w-0 ${
                   isStreaming
                     ? "text-teal-100"
                     : "disabled:opacity-50"
                 }`}
               >
-                <span className="opacity-60 mr-2">#{c.id}</span>
-                <span className="opacity-80">
-                  {c.intelligibility ?? "—"} · {(c.duration_ms / 1000).toFixed(1)}s
-                </span>
-                {isStreaming && (
-                  <span className="ml-2 text-teal-300">streaming…</span>
-                )}
+                <div className="flex items-center gap-2 text-[10px] opacity-60 mb-0.5">
+                  <span>#{c.id}</span>
+                  <span>{(c.duration_ms / 1000).toFixed(1)}s</span>
+                  {c.prompt_set && c.prompt_set !== "unknown" && (
+                    <span
+                      className={`uppercase tracking-wide ${
+                        c.prompt_set === "timit"
+                          ? "text-emerald-300/80"
+                          : c.prompt_set === "non-word"
+                            ? "text-rose-300/80"
+                            : "opacity-70"
+                      }`}
+                    >
+                      {PROMPT_SET_LABELS[c.prompt_set as PromptSet] ??
+                        c.prompt_set}
+                    </span>
+                  )}
+                  {isStreaming && (
+                    <span className="text-teal-300">streaming…</span>
+                  )}
+                </div>
+                <div className="text-[12px] leading-snug truncate font-sans opacity-90">
+                  {c.intended_text || "—"}
+                </div>
               </button>
             </div>
           );
