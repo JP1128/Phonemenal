@@ -16,21 +16,29 @@ Spec rules baked in:
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Iterable
+from typing import Any, Iterable
+
+logger = logging.getLogger("phonemer.context")
 
 
 # ============================================================ tunables
 
 
 UTTERANCE_HALFLIFE_S = 14.0
-TOPIC_HALFLIFE_S = 240.0
+TOPIC_HALFLIFE_S = 120.0
 TOPIC_RELEVANCE_FLOOR = 0.1
 VOCAB_LINGER_MULTIPLIER = 1.3
+# Topics below this decayed weight don't appear in the UI's "active topics".
+# A single mention starts at 1.0 and decays past this floor in roughly
+# 1 half-life, so one-off words ("hello") drop out within ~2 minutes
+# instead of lingering at the relevance floor forever.
+TOPIC_DISPLAY_FLOOR = 0.5
 PENDING_PEAK_S = 5.0
 PENDING_EXPIRY_S = 30.0
 
@@ -98,13 +106,45 @@ class UtteranceLog:
 
 _KEYWORD_RE = re.compile(r"\b[a-zA-Z]{4,}\b")
 _STOPWORDS = {
-    "have", "your", "with", "this", "that", "from", "they", "them",
-    "what", "when", "where", "would", "could", "should", "about",
-    "their", "there", "here", "thing", "going", "doing", "really",
-    "still", "again", "right", "feel", "feeling", "felt", "very",
-    "much", "more", "less", "okay", "alright", "tell", "told", "good",
-    "well", "down", "back", "just", "want", "need", "know",
-    "yourself", "myself", "today", "yesterday", "tomorrow",
+    # function words / determiners (4+ chars; the regex already drops <4)
+    "have", "having", "your", "yours", "with", "without", "this", "that",
+    "those", "these", "from", "into", "onto", "upon", "they", "them",
+    "their", "there", "here", "what", "when", "where", "while", "whom",
+    "whose", "which", "would", "could", "should", "about", "above",
+    "below", "across", "after", "before", "between", "during", "since",
+    "though", "although", "however", "because", "than", "then", "until",
+    "unless", "either", "neither", "both", "each", "some", "such",
+    "very", "much", "more", "less", "most", "least", "many", "several",
+    "even", "ever", "never", "always", "often", "sometimes", "anyway",
+    "still", "again", "also", "only", "just", "quite", "rather",
+    "almost", "nearly", "another", "other", "others", "same", "every",
+    # courtesy / greetings / fillers
+    "hello", "good", "goodbye", "please", "thank", "thanks", "welcome",
+    "sure", "yeah", "alright", "okay", "right", "fine", "great",
+    # generic verbs that rarely carry topical meaning
+    "doing", "done", "going", "gone", "make", "makes", "made", "making",
+    "take", "takes", "took", "taken", "taking", "give", "given", "gave",
+    "giving", "gives", "come", "comes", "came", "coming", "look", "looks",
+    "looked", "looking", "seem", "seems", "seemed", "seeming", "find",
+    "found", "feel", "feels", "felt", "feeling", "tell", "told", "tells",
+    "telling", "want", "wants", "wanted", "wanting", "need", "needs",
+    "needed", "know", "knows", "known", "knowing", "said", "says",
+    "saying", "talk", "talks", "talked", "talking", "think", "thinks",
+    "thought", "thinking", "let", "lets", "letting", "keep", "kept",
+    "keeps", "keeping", "really", "actually", "basically", "literally",
+    "honestly", "probably", "perhaps", "maybe",
+    # common nouns that are too generic to count as a topic on their own
+    "thing", "things", "stuff", "kind", "kinds", "type", "types", "sort",
+    "sorts", "lot", "lots", "today", "tonight", "yesterday", "tomorrow",
+    "year", "years", "month", "months", "week", "weeks", "hour", "hours",
+    "minute", "minutes", "second", "seconds", "moment", "moments",
+    # pronouns / reflexives 4+ chars
+    "yourself", "myself", "himself", "herself", "itself", "themselves",
+    "ourselves",
+    # state-of-being / aux 4+ chars
+    "been", "being", "were", "have", "having",
+    # generic adjectives
+    "well", "down", "back", "long", "short", "true", "false",
 }
 
 
@@ -115,35 +155,144 @@ class Topic:
     last_observed: float = field(default_factory=_now)
 
 
+# Small extra filter on top of POS-tagging — high-frequency nouns that
+# pass NOUN/PROPN but carry no topical meaning. spaCy's `is_stop` already
+# catches most function words, but generic nouns like "thing" / "stuff"
+# need an explicit list because spaCy correctly identifies them as nouns.
+_NLP_CONTENT_STOPWORDS = {
+    "thing", "things", "stuff", "kind", "kinds", "sort", "sorts",
+    "type", "types", "lot", "lots", "way", "ways", "side", "sides",
+    "place", "places", "person", "people", "guy", "someone", "something",
+    "anything", "everything", "nothing",
+    "today", "tonight", "tomorrow", "yesterday",
+    "year", "years", "month", "months", "week", "weeks",
+    "hour", "hours", "minute", "minutes", "second", "seconds",
+    "moment", "moments", "time", "times",
+    "hello", "hi", "hey", "thanks", "thank",
+}
+
+# Lazy-loaded spaCy pipeline. Loaded once per process; reused across
+# every TopicTracker. Falls back to the regex+stopword path if spaCy or
+# the model isn't installed (`pip install spacy && python -m spacy
+# download en_core_web_sm`).
+_nlp_singleton: Any = None
+_nlp_load_attempted = False
+
+
+def _get_nlp() -> Any:
+    global _nlp_singleton, _nlp_load_attempted
+    if _nlp_load_attempted:
+        return _nlp_singleton
+    _nlp_load_attempted = True
+    try:
+        import spacy  # type: ignore[import-not-found]
+
+        # Disable parser — we only need tokenizer + tagger + NER. ~3x faster
+        # and the dependency graph isn't used for keyword extraction.
+        _nlp_singleton = spacy.load("en_core_web_sm", disable=["parser"])
+        logger.info("spaCy loaded for topic extraction (en_core_web_sm)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "spaCy unavailable (%s) — topic extraction falls back to regex",
+            e,
+        )
+        _nlp_singleton = None
+    return _nlp_singleton
+
+
 class TopicTracker:
-    """Keyword-based topic accumulator with exponential decay + floor."""
+    """Topic accumulator with exponential decay + display floor.
+
+    Extracts keywords with spaCy POS tagging (NOUN / PROPN only) plus
+    NER (PERSON / ORG / GPE / PRODUCT / EVENT / WORK_OF_ART) so meaningful
+    nouns and named entities both surface as topics. Falls back to a
+    regex+stopword scan if spaCy or its model isn't loaded.
+    """
+
+    # spaCy entity labels we want to capture as topical (the rest are
+    # quantitative / temporal / numeric and not interesting as topics).
+    _ENTITY_LABELS: frozenset[str] = frozenset(
+        {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "WORK_OF_ART", "FAC"}
+    )
 
     def __init__(self, max_topics: int = 20) -> None:
         self.max_topics = max_topics
         self._topics: dict[str, Topic] = {}
 
     def observe(self, text: str, weight: float = 1.0) -> None:
+        if not text or not text.strip():
+            return
+        nlp = _get_nlp()
+        if nlp is None:
+            self._observe_regex(text, weight)
+            return
+
+        now = _now()
+        seen: set[str] = set()
+        doc = nlp(text)
+
+        # Multi-token named entities first — preserves "Dr. Smith" /
+        # "blood pressure cuff" as a single keyword instead of letting the
+        # token loop split them apart.
+        for ent in doc.ents:
+            if ent.label_ not in self._ENTITY_LABELS:
+                continue
+            key = ent.text.strip().lower()
+            if not key or key in seen:
+                continue
+            if key in _NLP_CONTENT_STOPWORDS:
+                continue
+            seen.add(key)
+            self._reinforce(key, weight, now)
+
+        # Single-token nouns / proper nouns. Use lemmas so "shoulders" and
+        # "shoulder" merge.
+        for tok in doc:
+            if tok.is_stop or tok.is_punct or tok.is_space:
+                continue
+            if tok.pos_ not in ("NOUN", "PROPN"):
+                continue
+            lemma = (tok.lemma_ or tok.text).lower().strip()
+            if len(lemma) < 3:
+                continue
+            if lemma in _NLP_CONTENT_STOPWORDS or lemma in seen:
+                continue
+            seen.add(lemma)
+            self._reinforce(lemma, weight, now)
+
+    def _observe_regex(self, text: str, weight: float) -> None:
+        """Legacy fallback: regex tokenizer + handcrafted stopword set."""
         now = _now()
         seen: set[str] = set()
         for tok in _KEYWORD_RE.findall(text.lower()):
             if tok in _STOPWORDS or tok in seen:
                 continue
             seen.add(tok)
-            t = self._topics.get(tok)
-            if t is None:
-                self._topics[tok] = Topic(keyword=tok, weight=weight, last_observed=now)
-            else:
-                # Re-observation reinforces (capped). Don't grow without bound.
-                t.weight = min(5.0, t.weight + weight)
-                t.last_observed = now
+            self._reinforce(tok, weight, now)
+
+    def _reinforce(self, key: str, weight: float, now: float) -> None:
+        t = self._topics.get(key)
+        if t is None:
+            self._topics[key] = Topic(keyword=key, weight=weight, last_observed=now)
+        else:
+            # Re-observation reinforces (capped) so a single repeated word
+            # doesn't dominate forever.
+            t.weight = min(5.0, t.weight + weight)
+            t.last_observed = now
 
     def active(self, k: int = 8) -> list[dict]:
+        """Topics that are still salient *for display*. Filters by
+        TOPIC_DISPLAY_FLOOR so single-mention words ("hello") drop out
+        after a half-life or two instead of sticking forever via the
+        legacy relevance floor.
+        """
         now = _now()
         ranked: list[tuple[str, float]] = []
         for keyword, t in self._topics.items():
             age = now - t.last_observed
             decayed = _decay(t.weight, age, TOPIC_HALFLIFE_S)
-            decayed = max(decayed, TOPIC_RELEVANCE_FLOOR)
+            if decayed < TOPIC_DISPLAY_FLOOR:
+                continue
             ranked.append((keyword, decayed))
         ranked.sort(key=lambda kv: kv[1], reverse=True)
         return [{"keyword": k, "weight": round(v, 3)} for k, v in ranked[:k]]
@@ -320,11 +469,17 @@ class EmotionalStateTracker:
     """Inferred from prosody only (per spec rule — never from word content).
 
     We use jitter, shimmer, pause counts, and abandoned-utterance rate.
+
+    When a patient ``baseline`` (median jitter/shimmer/pause_ratio over their
+    own calibration utterances) is provided, we measure the *delta* from
+    that baseline so dysarthric patients aren't pegged at "high distress"
+    by the natural voice-quality signature of their disorder.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, baseline: dict | None = None) -> None:
         self._state = EmotionalSignal()
         self._abandoned_window: list[float] = []
+        self._baseline = baseline or {}
 
     def observe_features(self, features: dict) -> None:
         jitter = float(features.get("jitter", 0) or 0)
@@ -333,11 +488,21 @@ class EmotionalStateTracker:
         pause_total = int(features.get("pause_total_ms", 0) or 0)
         duration = max(1, int(features.get("duration_ms", 1) or 1))
 
-        # Distress: high jitter + shimmer (voice-quality breakdown).
-        distress = min(1.0, jitter * 6.0 + shimmer * 4.0)
-        # Frustration: many pauses relative to utterance length.
+        # Subtract the patient's calibration baseline (clamped at 0). Without
+        # this step a dysarthric speaker's normal jitter ~0.10 + shimmer
+        # ~0.12 would push distress to ~1.0 every utterance. With baseline,
+        # distress represents how much THIS utterance deviates from how the
+        # patient normally sounds.
+        bl = self._baseline
+        jitter_d = max(0.0, jitter - float(bl.get("jitter_p50", 0) or 0))
+        shimmer_d = max(0.0, shimmer - float(bl.get("shimmer_p50", 0) or 0))
         pause_ratio = pause_total / duration
-        frustration = min(1.0, 0.4 * pauses / 5.0 + 0.6 * pause_ratio)
+        pause_ratio_d = max(
+            0.0, pause_ratio - float(bl.get("pause_ratio_p50", 0) or 0)
+        )
+
+        distress = min(1.0, jitter_d * 6.0 + shimmer_d * 4.0)
+        frustration = min(1.0, 0.4 * pauses / 5.0 + 0.6 * pause_ratio_d)
 
         s = self._state
         # EMA so single utterances don't whipsaw the gauge.
@@ -401,13 +566,19 @@ def _time_of_day_now() -> str:
 class ContextManager:
     """Per-session aggregator wiring all six layers together."""
 
-    def __init__(self, session_id: int, max_recent: int = 20) -> None:
+    def __init__(
+        self,
+        session_id: int,
+        max_recent: int = 20,
+        prosody_baseline: dict | None = None,
+    ) -> None:
         self.session_id = session_id
         self.utterance_log = UtteranceLog(max_recent=max_recent)
         self.topics = TopicTracker()
         self.questions = PendingQuestionQueue()
         self.speakers = SpeakerRegistry()
-        self.emotion = EmotionalStateTracker()
+        self.emotion = EmotionalStateTracker(baseline=prosody_baseline)
+        self._prosody_baseline = prosody_baseline or {}
         self.metadata = SessionMetadata(time_of_day=_time_of_day_now())
         self._lock = Lock()
 
@@ -452,6 +623,9 @@ class ContextManager:
     def observe_abandoned_utterance(self) -> None:
         with self._lock:
             self.emotion.observe_abandoned_utterance()
+
+    def get_prosody_baseline(self) -> dict:
+        return self._prosody_baseline
 
     # ----- output ------------------------------------------------------
 

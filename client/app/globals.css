@@ -11,3 +11,87 @@ body {
   background: var(--color-background);
   color: var(--color-foreground);
 }
+
+/* Used by the /how-it-works presentation slides for sub-step transitions.
+   Apply via `animate-[fadeUp_400ms_ease-out_both]` on a keyed element so a
+   new state fades in from below as the slide morphs. */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* /how-it-works architecture slide visualizations */
+@keyframes whisperToken {
+  0% {
+    top: 70%;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    top: 5%;
+    opacity: 0;
+  }
+}
+
+@keyframes pulseFade {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* /how-it-works architecture slide — comet streak along connector paths.
+   Used by FlowLine: each layer has dasharray "W (100-W)" with
+   pathLength=100, so exactly one dash of width W is on the path. As
+   stroke-dashoffset goes 0 → -100, that single dash sweeps from start
+   to end. Stacked layers with staggered animation-delays form a
+   fading tail behind the head. */
+@keyframes cometDash {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
+/* /how-it-works architecture slide — speaker similarity marker animation. */
+@keyframes speakerMarker {
+  0% {
+    left: 0%;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  90% {
+    left: 91%;
+    opacity: 1;
+  }
+  100% {
+    left: 91%;
+    opacity: 0.6;
+  }
+}

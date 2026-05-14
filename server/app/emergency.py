@@ -90,8 +90,22 @@ def check_text(*, primary: str, alternatives: list[str], overall_confidence: flo
     return EmergencyAlert(triggered=False)
 
 
-def check_prosody(features: dict, emotion: dict) -> EmergencyAlert:
-    """Fire on voice-quality red flags before/without an LLM translation."""
+def check_prosody(
+    features: dict,
+    emotion: dict,
+    baseline: dict | None = None,
+) -> EmergencyAlert:
+    """Fire on voice-quality red flags before/without an LLM translation.
+
+    When a calibrated patient ``baseline`` is provided, threshold on the
+    *delta* over baseline — dysarthric speech has elevated jitter/shimmer
+    at rest and the absolute thresholds tuned for healthy speakers fire
+    constantly without this correction.
+
+    When no baseline is available, fall back to higher absolute thresholds
+    (a deliberate retune) — false-positive prosody emergencies are worse
+    than the original tunables suggested for impaired speech.
+    """
     if not features:
         return EmergencyAlert(triggered=False)
 
@@ -99,8 +113,15 @@ def check_prosody(features: dict, emotion: dict) -> EmergencyAlert:
     shimmer = float(features.get("shimmer", 0) or 0)
     distress = float(emotion.get("distress", 0) or 0)
 
-    # Tunables — generous on the side of false positives.
-    if distress >= 0.8:
+    bl = baseline or {}
+    has_baseline = bool(bl)
+
+    # `distress` is computed by EmotionalStateTracker; when a baseline is
+    # active that score is already a delta, so a 0.6 reading represents a
+    # meaningful escalation. Without a baseline the score sits high on
+    # dysarthric speech, so we require a much higher absolute reading.
+    distress_threshold = 0.6 if has_baseline else 0.95
+    if distress >= distress_threshold:
         return EmergencyAlert(
             triggered=True,
             category="distress",
@@ -108,12 +129,21 @@ def check_prosody(features: dict, emotion: dict) -> EmergencyAlert:
             confidence=distress,
             sources=["prosody", "distress_score"],
         )
-    if jitter > 0.08 and shimmer > 0.10:
+
+    if has_baseline:
+        jitter_threshold = float(bl.get("jitter_p50", 0) or 0) + 0.08
+        shimmer_threshold = float(bl.get("shimmer_p50", 0) or 0) + 0.10
+    else:
+        jitter_threshold = 0.15
+        shimmer_threshold = 0.20
+    if jitter > jitter_threshold and shimmer > shimmer_threshold:
+        excess_j = jitter - jitter_threshold
+        excess_s = shimmer - shimmer_threshold
         return EmergencyAlert(
             triggered=True,
             category="distress",
             phrase=None,
-            confidence=min(1.0, (jitter + shimmer) * 4),
+            confidence=min(1.0, (excess_j + excess_s) * 4),
             sources=["prosody", "jitter+shimmer"],
         )
     return EmergencyAlert(triggered=False)

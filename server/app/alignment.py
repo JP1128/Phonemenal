@@ -9,12 +9,54 @@ forced_align(...)       torchaudio CTC alignment given audio + intended IPA.
 """
 from __future__ import annotations
 
+import logging
+import threading
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
 
 from .vocab import normalize_phonemes
+
+# Suppress phonemizer's "words count mismatch on X% of the lines"
+# warnings. Triggered every time we phonemize a word that espeak
+# segments into >1 internal "word" (contractions, possessives, etc.).
+# Noise — we don't care about espeak's internal word counting, only
+# its phoneme output.
+#
+# Belt and suspenders: setLevel(CRITICAL) so all WARNING/ERROR
+# records get filtered, propagate=False so the records don't bubble
+# to the root logger (which is what uvicorn formats and prints), and
+# a final no-op Filter that drops every record even if a downstream
+# library re-enables the logger.
+_phon_logger = logging.getLogger("phonemizer")
+_phon_logger.setLevel(logging.CRITICAL)
+_phon_logger.propagate = False
+_phon_logger.addFilter(lambda _record: False)
+
+
+# Lazy, shared EspeakBackend. The high-level ``phonemize()`` helper from
+# the phonemizer package re-initializes a backend on every call —
+# ~700 ms of espeak init overhead per invocation, which dominates the
+# rescoring loop (3 candidates × 700 ms = 2.1 s of pure init per
+# utterance). Holding a single persistent backend drops that to ~0 ms.
+# Initialised on first use because espeak's library path is set up by
+# ``app/__init__.py``, which may not yet be on sys.path at import time.
+_BACKEND_LOCK = threading.Lock()
+_BACKEND_CACHE: dict[str, Any] = {}
+
+
+def _get_backend(language: str):
+    with _BACKEND_LOCK:
+        be = _BACKEND_CACHE.get(language)
+        if be is None:
+            from phonemizer.backend import EspeakBackend  # heavy import deferred
+            be = EspeakBackend(
+                language, preserve_punctuation=False, with_stress=False,
+            )
+            _BACKEND_CACHE[language] = be
+        return be
 
 
 @dataclass
@@ -49,22 +91,54 @@ def text_to_phonemes(text: str, language: str = "en-us") -> list[str]:
     Forcing a phone-level separator gives ``["æ", "l", "f", "ə"]`` that maps
     cleanly into the vocab.
     """
-    from phonemizer import phonemize  # heavy import deferred
     from phonemizer.separator import Separator
 
-    raw = phonemize(
-        [text],
-        language=language,
-        backend="espeak",
-        separator=Separator(phone=" ", syllable="", word=" | "),
-        strip=True,
-        with_stress=False,
-        preserve_punctuation=False,
-        njobs=1,
-    )[0]
-    # Drop the word-boundary marker before vocab normalization.
+    be = _get_backend(language)
+    with _BACKEND_LOCK:  # phonemizer backends are not thread-safe
+        raw = be.phonemize(
+            [text],
+            separator=Separator(phone=" ", syllable="", word=" | "),
+            strip=True,
+        )[0]
     raw = raw.replace("|", " ")
     return normalize_phonemes(raw)
+
+
+def text_to_word_phonemes(
+    text: str, language: str = "en-us"
+) -> list[tuple[str, list[str]]]:
+    """Per-word phonemization, returning ``(word, [phonemes])`` pairs.
+
+    Phonemizes each whitespace-separated word *as its own input* rather
+    than relying on espeak's ``|`` word separator inside one call.
+    Reason: in connected speech, espeak fuses short function words into
+    the preceding chunk ("for the" → ``"f ɚ ð ə"`` as a single chunk),
+    so the chunk count no longer matches ``text.split()`` and per-word
+    aggregation drifts. Phonemizing words individually preserves a
+    strict 1-to-1 mapping from input words to phoneme lists.
+
+    Words that phonemize to nothing after vocab normalization (rare;
+    typically punctuation-only tokens) are omitted from the output.
+    """
+    from phonemizer.separator import Separator
+
+    src_words = text.split()
+    if not src_words:
+        return []
+    be = _get_backend(language)
+    with _BACKEND_LOCK:
+        raw_list = be.phonemize(
+            src_words,
+            separator=Separator(phone=" ", syllable="", word=""),
+            strip=True,
+        )
+    pairs: list[tuple[str, list[str]]] = []
+    for word, raw in zip(src_words, raw_list):
+        normalized = normalize_phonemes(raw)
+        if not normalized:
+            continue
+        pairs.append((word, normalized))
+    return pairs
 
 
 def forced_align(

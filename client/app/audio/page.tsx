@@ -179,6 +179,8 @@ function summarizeForDiag(m: WsMessage): string {
       return `⚠ ${m.phrase ?? m.category ?? "alert"}`;
     case "translation_error":
       return `LLM error: ${m.message}`;
+    case "diag":
+      return `${m.level}: ${m.msg}`;
   }
 }
 

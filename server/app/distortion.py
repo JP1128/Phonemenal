@@ -62,6 +62,11 @@ class PatientDistortionProfile:
     cluster_simplifications: dict[str, dict[str, int]]
     syllable_deletion_rate: float
     fatigue_priors: dict[str, float]
+    # Median voice-quality features over the patient's calibration set.
+    # Used at runtime to threshold distress/emergency detection on the
+    # delta from this patient's normal speech, instead of absolute
+    # values — dysarthric speech has elevated jitter/shimmer at rest.
+    prosody_baseline: dict[str, float] | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -75,6 +80,7 @@ class PatientDistortionProfile:
                 "cluster_simplifications": self.cluster_simplifications,
                 "syllable_deletion_rate": self.syllable_deletion_rate,
                 "fatigue_priors": self.fatigue_priors,
+                "prosody_baseline": self.prosody_baseline,
             },
             ensure_ascii=False,
         )
@@ -86,6 +92,7 @@ class PatientDistortionProfile:
 def build_profile(
     aligned_utterances: list[dict],
     vocab_symbols: list[str],
+    features_list: list[dict] | None = None,
 ) -> PatientDistortionProfile:
     """Aggregate alignment data from many calibration utterances into a profile.
 
@@ -94,6 +101,13 @@ def build_profile(
       - aligned: list[AlignedToken]             (alignment of intended → frames)
       - produced: list[list[tuple[str, float]]] (top-k phonemes per frame)
       - intended_words_phonemes: list[list[str]] (words split into phonemes)
+
+    ``features_list`` is the matching per-utterance prosody output of
+    ``features.extract`` (jitter, shimmer, pause_count, pause_total_ms,
+    duration_ms). Median values become the patient's prosody baseline, so
+    runtime distress detection can fire on the delta from this patient's
+    normal voice quality instead of absolute thresholds that don't fit
+    dysarthric speech.
     """
     overall = _new_matrix(vocab_symbols)
     initial = _new_matrix(vocab_symbols)
@@ -156,6 +170,25 @@ def build_profile(
     # Fatigue priors are computed online during sessions; seed them flat here.
     fatigue_priors = {"fresh": 1.0, "mild": 1.1, "moderate": 1.25, "severe": 1.5}
 
+    prosody_baseline: dict[str, float] | None = None
+    if features_list:
+        jitters = [float(f.get("jitter", 0) or 0) for f in features_list]
+        shimmers = [float(f.get("shimmer", 0) or 0) for f in features_list]
+        pause_ratios = [
+            float(f.get("pause_total_ms", 0) or 0)
+            / max(1.0, float(f.get("duration_ms", 1) or 1))
+            for f in features_list
+        ]
+        pause_counts = [float(f.get("pause_count", 0) or 0) for f in features_list]
+        if jitters:
+            prosody_baseline = {
+                "jitter_p50": _median(jitters),
+                "shimmer_p50": _median(shimmers),
+                "pause_ratio_p50": _median(pause_ratios),
+                "pause_count_p50": _median(pause_counts),
+                "n_samples": float(len(jitters)),
+            }
+
     return PatientDistortionProfile(
         n_calibration_utterances=n_utt,
         intended_phoneme_counts=dict(intended_counts),
@@ -166,7 +199,18 @@ def build_profile(
         cluster_simplifications={k: dict(v) for k, v in cluster_simp.items()},
         syllable_deletion_rate=deletion_rate,
         fatigue_priors=fatigue_priors,
+        prosody_baseline=prosody_baseline,
     )
+
+
+def _median(xs: list[float]) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    n = len(s)
+    if n % 2 == 1:
+        return float(s[n // 2])
+    return float((s[n // 2 - 1] + s[n // 2]) / 2.0)
 
 
 # ============================================================ utilities

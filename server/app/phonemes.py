@@ -1,4 +1,10 @@
-"""Wav2Vec2 phoneme probability extraction (Layer 3 of the pipeline)."""
+"""Wav2Vec2 phoneme probability extraction (Layer 3 of the pipeline).
+
+NOTE: This file backs slide 4 of ``client/app/how-it-works/page.tsx``.
+If you change the phoneme model, frame stride, or vocabulary size here,
+update the matching slide on the page in the same commit. See CLAUDE.md
+("Documentation invariant").
+"""
 from __future__ import annotations
 
 import numpy as np

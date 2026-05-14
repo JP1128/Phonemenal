@@ -25,6 +25,9 @@ export type SessionApi = {
   start: () => Promise<void>;
   stop: () => Promise<void>;
   sendStop: () => void;
+  // Force-close and re-open the WS. Used by the header pill when the
+  // connection drops, so the user can recover without a hard refresh.
+  reconnect: () => void;
   // Stream a WAV buffer through the same connection (TORGO clips, dropped files).
   streamBuffer: (buf: ArrayBuffer) => Promise<void>;
 };
@@ -76,6 +79,28 @@ export function usePhonemerSession(opts: SessionOptions): SessionApi {
       connRef.current = null;
     };
   }, []);
+
+  // When the WS URL changes (e.g. the user picks a different patient
+  // profile, which switches the `?adapter_speaker=…` query param),
+  // tear down the existing connection + mic so the next start() opens
+  // a fresh session against the new URL. Mid-stream URL flips would
+  // otherwise route audio to a stale adapter or to a null conn.
+  const prevUrlRef = useRef<string>(url);
+  useEffect(() => {
+    if (prevUrlRef.current === url) return;
+    prevUrlRef.current = url;
+    if (captureRef.current) {
+      captureRef.current.stop();
+      captureRef.current = null;
+    }
+    if (connRef.current) {
+      connRef.current.disconnect();
+      connRef.current = null;
+    }
+    setMicState("idle");
+    setLevel(0);
+    setHealth({ ...INITIAL_HEALTH });
+  }, [url]);
 
   const start = useCallback(async () => {
     setErrorMessage(undefined);
@@ -138,6 +163,13 @@ export function usePhonemerSession(opts: SessionOptions): SessionApi {
     connRef.current?.sendControl({ type: "stop" });
   }, []);
 
+  const reconnect = useCallback(() => {
+    setErrorMessage(undefined);
+    const conn = ensureConn();
+    conn.disconnect();
+    conn.connect();
+  }, [ensureConn]);
+
   return {
     micState,
     connState: health.state,
@@ -147,6 +179,7 @@ export function usePhonemerSession(opts: SessionOptions): SessionApi {
     start,
     stop,
     sendStop,
+    reconnect,
     streamBuffer,
   };
 }

@@ -18,3 +18,9 @@ pytest>=8.0.0
 anthropic>=0.40.0
 python-dotenv>=1.0.0
 datasets>=2.20.0
+peft>=0.10.0
+accelerate>=0.30.0
+jiwer>=3.0.0
+spacy>=3.7.0
+# Run after install: python -m spacy download en_core_web_sm
+# (~13 MB model used by context.TopicTracker for POS+NER topic extraction)

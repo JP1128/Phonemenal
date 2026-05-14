@@ -4,13 +4,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import subprocess
+import sqlite3
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body,
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -28,14 +40,22 @@ from .db import (
     connect,
     create_calibration,
     create_session,
+    create_training_job,
     create_utterance,
+    delete_calibration,
     end_session,
+    get_calibration,
     get_torgo_clip,
+    get_training_job,
+    list_calibrations,
+    list_corrective_training_pairs,
+    list_training_jobs_for_calibration,
     latest_patient_profile,
     list_calibration_utterances,
     list_recent_patient_utterances,
     list_torgo_clips,
     mark_questions_answered,
+    rename_calibration,
     set_utterance_transcript,
     upsert_session_metadata,
     write_emotion_snapshot,
@@ -54,7 +74,7 @@ from .emergency import check_prosody, check_text
 from .phonemes import FRAME_STRIDE_SAMPLES, PhonemeExtractor
 from .silero_vad import make_vad
 from .speaker_id import SpeakerIdentifier, ensure_schema
-from .stt import GatedTranscriber, Transcriber
+from .stt import AdaptedTranscriber, GatedTranscriber, Transcriber
 from .vad import Utterance, UtteranceSegmenter
 
 logger = logging.getLogger("phonemer")
@@ -90,11 +110,42 @@ async def lifespan(app: FastAPI):
     )
     logger.info("VAD ready")
 
+    # Plain Whisper for non-patient (listener / caregiver) speech. faster-
+    # whisper is used because it's much faster at inference than HF Whisper
+    # and patient personalization isn't needed for unimpaired speakers.
     app.state.transcriber = Transcriber(
         model_size=settings.stt_model_size,
         compute_type=settings.stt_compute_type,
         device=settings.device,
     )
+
+    # Patient transcription path: prefer per-patient PEFT adapter when one
+    # exists at ``settings.patient_adapter_dir``; fall back to the plain
+    # transcriber when not. The adapter is the calibrated personalization
+    # produced by ``server/scripts/train_patient_adapter.py`` —
+    # whisper-small base + LoRA delta calibrated to this patient's
+    # speech (-32% to -47% relative WER on TORGO dysarthric speakers).
+    patient_adapter_path = Path(settings.patient_adapter_dir)
+    has_adapter = (
+        patient_adapter_path.exists()
+        and (patient_adapter_path / "adapter_model.safetensors").exists()
+        and (patient_adapter_path / "adapter_config.json").exists()
+    )
+    if has_adapter:
+        logger.info(
+            "Patient adapter found at %s — using AdaptedTranscriber",
+            patient_adapter_path,
+        )
+        app.state.patient_transcriber = AdaptedTranscriber(
+            adapter_dir=str(patient_adapter_path),
+            device=settings.device,
+        )
+    else:
+        logger.info(
+            "No patient adapter at %s — patient path uses plain Whisper",
+            patient_adapter_path,
+        )
+        app.state.patient_transcriber = app.state.transcriber
 
     # Gated transcriber: Whisper + phoneme-alignment safety gate. This is
     # the patient translation path now that empirical evidence (see
@@ -103,17 +154,124 @@ async def lifespan(app: FastAPI):
     # can render them as low-trust rather than confidently surfacing
     # made-up content.
     app.state.gate = GatedTranscriber(
-        transcriber=app.state.transcriber,
+        transcriber=app.state.patient_transcriber,
         extractor=app.state.extractor,
         token_to_id=app.state.extractor.processor.tokenizer.get_vocab(),
         blank_id=app.state.extractor.processor.tokenizer.pad_token_id or 0,
         sample_rate=settings.sample_rate,
+        min_alignment_score=settings.gate_min_alignment_score,
+        min_phoneme_density=settings.gate_min_phoneme_density,
+        density_check_min_duration_s=settings.gate_density_check_min_duration_s,
+        n_best=settings.gate_n_best,
+    )
+
+    # Multi-base support. The default ``patient`` adapter pins a single
+    # base (whisper-small.en today). But some speakers — e.g. M01 — have
+    # a separately-trained adapter against a *different* base
+    # (whisper-medium.en) that meaningfully outperforms the small one.
+    # Load one ``AdaptedTranscriber`` + ``GatedTranscriber`` per unique
+    # base model referenced by any adapter on disk so a single backend
+    # can route each speaker's request to the right base without
+    # restart. Memory cost is ~3 GB extra for whisper-medium fp32 — fine
+    # on a 24 GB Apple M4. ``_resolve_adapter_dir`` picks the most
+    # recently-trained adapter for a speaker; ``_pick_gate_for_adapter``
+    # finds the matching gate by reading the adapter's BASE_MODEL.txt.
+    app.state.bases: dict[str, dict] = {}
+    adapters_root = Path(settings.patient_adapter_dir).parent
+    discovered_bases: set[str] = set()
+    if adapters_root.exists():
+        for d in adapters_root.iterdir():
+            if not d.is_dir():
+                continue
+            if d.name == "patient" or d.name.startswith("pool_"):
+                continue
+            if not (d / "adapter_model.safetensors").exists():
+                continue
+            marker = d / "BASE_MODEL.txt"
+            if not marker.exists():
+                continue
+            try:
+                discovered_bases.add(marker.read_text().strip())
+            except OSError:
+                pass
+    # Always include the configured default's base.
+    default_marker = Path(settings.patient_adapter_dir) / "BASE_MODEL.txt"
+    default_base = (
+        default_marker.read_text().strip() if default_marker.exists()
+        else "openai/whisper-small.en"
+    )
+    discovered_bases.add(default_base)
+    # The default base is already loaded above. Register it as the
+    # default and lazy-load any *additional* bases on top.
+    app.state.bases[default_base] = {
+        "transcriber": app.state.patient_transcriber,
+        "gate": app.state.gate,
+        "default_adapter": str(patient_adapter_path),
+    }
+    for base in discovered_bases:
+        if base in app.state.bases:
+            continue
+        # Pick a default adapter for this base (any adapter whose
+        # BASE_MODEL.txt matches). Used only as the *initial* adapter
+        # the transcriber loads; per-request adapter swaps happen via
+        # AdaptedTranscriber._ensure_adapter.
+        seed: Path | None = None
+        for d in adapters_root.iterdir():
+            if not d.is_dir():
+                continue
+            if d.name == "patient" or d.name.startswith("pool_"):
+                continue
+            cand_marker = d / "BASE_MODEL.txt"
+            if not cand_marker.exists():
+                continue
+            try:
+                if cand_marker.read_text().strip() == base and (
+                    d / "adapter_model.safetensors"
+                ).exists():
+                    seed = d
+                    break
+            except OSError:
+                continue
+        if seed is None:
+            logger.warning("no seed adapter found for base %s, skipping", base)
+            continue
+        logger.info("Loading additional base %s with seed adapter %s", base, seed)
+        extra_transcriber = AdaptedTranscriber(
+            adapter_dir=str(seed),
+            base_model=base,
+            device=settings.device,
+        )
+        extra_gate = GatedTranscriber(
+            transcriber=extra_transcriber,
+            extractor=app.state.extractor,
+            token_to_id=app.state.extractor.processor.tokenizer.get_vocab(),
+            blank_id=app.state.extractor.processor.tokenizer.pad_token_id or 0,
+            sample_rate=settings.sample_rate,
+            min_alignment_score=settings.gate_min_alignment_score,
+            min_phoneme_density=settings.gate_min_phoneme_density,
+            density_check_min_duration_s=settings.gate_density_check_min_duration_s,
+            n_best=settings.gate_n_best,
+        )
+        app.state.bases[base] = {
+            "transcriber": extra_transcriber,
+            "gate": extra_gate,
+            "default_adapter": str(seed),
+        }
+    logger.info(
+        "loaded %d base(s): %s",
+        len(app.state.bases), list(app.state.bases.keys()),
     )
 
     app.state.db = connect(settings.db_path)
     ensure_schema(app.state.db)
     Path(settings.audio_dir).mkdir(parents=True, exist_ok=True)
     logger.info("SQLite ready at %s", settings.db_path)
+
+    # Warm the spaCy pipeline used by topic extraction so the first patient
+    # utterance doesn't eat the ~200 ms load latency. No-op if spaCy isn't
+    # installed — TopicTracker silently falls back to its regex path.
+    from .context import _get_nlp as _warm_nlp
+    _warm_nlp()
 
     try:
         yield
@@ -136,12 +294,16 @@ app.add_middleware(
 
 @app.get("/healthz")
 async def healthz() -> dict:
+    has_adapter = isinstance(app.state.patient_transcriber, AdaptedTranscriber)
     return {
         "ok": True,
         "model": settings.phoneme_model_name,
         "speaker_model": settings.speaker_model_source,
         "stt_model": settings.stt_model_size,
         "sample_rate": settings.sample_rate,
+        "patient_adapter": (
+            settings.patient_adapter_dir if has_adapter else None
+        ),
     }
 
 
@@ -157,23 +319,302 @@ async def calibration_sentences() -> dict:
     return _load_calibration_sentence_sets()
 
 
+@app.get("/calibrations")
+async def calibrations_list() -> dict:
+    """List every calibration with its utterance count so the doctor
+    can resume an in-progress patient instead of always starting fresh.
+    """
+    return {"calibrations": list_calibrations(app.state.db)}
+
+
+@app.patch("/calibrations/{calibration_id}")
+async def calibration_rename(
+    calibration_id: int, payload: dict | None = Body(None)
+) -> dict:
+    """Rename a calibration row's display label. The clinician uses this
+    to attach a label after the fact ("Room 412") to a row that was
+    started without one. Passing an empty string clears the label so
+    the UI falls back to ``Calibration #<id>``.
+    """
+    body = payload or {}
+    raw = body.get("display_name")
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(400, "display_name must be a string or null")
+    normalized = raw.strip() if isinstance(raw, str) else None
+    if normalized == "":
+        normalized = None
+    if not rename_calibration(app.state.db, calibration_id, normalized):
+        raise HTTPException(404, f"calibration {calibration_id} not found")
+    return {"id": calibration_id, "display_name": normalized}
+
+
+@app.delete("/calibrations/{calibration_id}")
+async def calibration_delete(calibration_id: int) -> dict:
+    """Remove an abandoned or test calibration row + its utterances /
+    training jobs (FK CASCADE handles dependents). Returns 404 if the
+    row doesn't exist so the UI can refresh the list cleanly.
+    """
+    if not delete_calibration(app.state.db, calibration_id):
+        raise HTTPException(404, f"calibration {calibration_id} not found")
+    return {"deleted": calibration_id}
+
+
 @app.post("/calibration/start")
-async def calibration_start() -> dict:
-    cid = create_calibration(app.state.db)
+async def calibration_start(payload: dict | None = Body(None)) -> dict:
+    """Start a new calibration or resume an existing one.
+
+    Body (optional):
+      * ``calibration_id`` — resume the given calibration; preserves all
+        utterances recorded so far. Returns 404 if not found.
+      * ``display_name`` — human-readable patient label. Stored on the
+        calibrations row; shown in the resume list. Ignored when resuming
+        (use a future rename endpoint to change it).
+    """
+    body = payload or {}
+    resume_id = body.get("calibration_id")
+    display_name = body.get("display_name") or None
+    if isinstance(display_name, str):
+        display_name = display_name.strip() or None
+
+    sentence_sets = _load_calibration_sentence_sets()["sets"]
+
+    if resume_id is not None:
+        try:
+            resume_id_int = int(resume_id)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"invalid calibration_id: {resume_id!r}") from e
+        cal = get_calibration(app.state.db, resume_id_int)
+        if cal is None:
+            raise HTTPException(404, f"calibration {resume_id_int} not found")
+        utterances = list_calibration_utterances(app.state.db, resume_id_int)
+        return {
+            "calibration_id": cal["id"],
+            "display_name": cal["display_name"],
+            "started_at": cal["started_at"],
+            "completed_at": cal["completed_at"],
+            "resumed": True,
+            "utterance_count": len(utterances),
+            "sentence_sets": sentence_sets,
+        }
+
+    cid = create_calibration(app.state.db, display_name=display_name)
     return {
         "calibration_id": cid,
-        "sentence_sets": _load_calibration_sentence_sets()["sets"],
+        "display_name": display_name,
+        "resumed": False,
+        "utterance_count": 0,
+        "sentence_sets": sentence_sets,
     }
 
 
 @app.get("/calibration/{calibration_id}")
 async def calibration_get(calibration_id: int) -> dict:
+    cal = get_calibration(app.state.db, calibration_id)
+    if cal is None:
+        raise HTTPException(404, f"calibration {calibration_id} not found")
     utterances = list_calibration_utterances(app.state.db, calibration_id)
     profile = latest_patient_profile(app.state.db, calibration_id)
     return {
         "calibration_id": calibration_id,
+        "display_name": cal["display_name"],
+        "started_at": cal["started_at"],
+        "completed_at": cal["completed_at"],
+        "utterance_count": len(utterances),
         "utterances": utterances,
         "profile": profile,
+    }
+
+
+_TRAIN_MIN_UTTERANCES = 30
+# Per-process registry of the live training subprocesses we've spawned.
+# Keyed by training_jobs.id; values are the Popen handles. Used to (a)
+# avoid retaining zombies on process exit and (b) liveness-check a row
+# whose subprocess crashed before writing its terminal status to the DB.
+_TRAINING_PROCS: dict[int, subprocess.Popen] = {}
+
+
+def _adapter_dir_for_calibration(calibration_id: int, slug: str) -> str:
+    """Resolve the adapter output directory used for a calibration's
+    trained LoRA. Sibling of ``settings.patient_adapter_dir`` so the
+    /adapters endpoint picks it up automatically."""
+    base = Path(settings.patient_adapter_dir).parent
+    safe_slug = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_" for ch in slug
+    ).strip("_") or f"cal_{calibration_id}"
+    return str((base / safe_slug).resolve())
+
+
+@app.post("/calibrations/{calibration_id}/train-adapter")
+async def train_adapter(
+    calibration_id: int, payload: dict | None = Body(None)
+) -> dict:
+    """Spawn a training subprocess that fine-tunes a per-patient LoRA
+    adapter on Whisper using this calibration's recorded utterances.
+
+    The subprocess updates its own ``training_jobs`` row as it runs
+    (queued → running → succeeded/failed); the caller polls
+    ``GET /training-jobs/{job_id}`` for status + log tail.
+    """
+    body = payload or {}
+    output_name = body.get("output_name")
+    extra_args: list[str] = body.get("extra_args") or []
+
+    cal = get_calibration(app.state.db, calibration_id)
+    if cal is None:
+        raise HTTPException(404, f"calibration {calibration_id} not found")
+
+    utterances = list_calibration_utterances(app.state.db, calibration_id)
+    usable = [u for u in utterances if u.get("audio_path")]
+    if len(usable) < _TRAIN_MIN_UTTERANCES:
+        raise HTTPException(
+            400,
+            f"need at least {_TRAIN_MIN_UTTERANCES} recorded utterances to train"
+            f" (have {len(usable)})",
+        )
+
+    # Pick adapter slug. Priority: explicit output_name → display_name → cal_<id>.
+    slug = (
+        (output_name or "").strip()
+        or (cal.get("display_name") or "").strip()
+        or f"cal_{calibration_id}"
+    )
+    adapter_dir = _adapter_dir_for_calibration(calibration_id, slug)
+
+    # Log location for live tail.
+    logs_dir = Path(settings.audio_dir).parent / "training_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(logs_dir / f"train_{int(time.time())}_{calibration_id}.log")
+
+    job_id = create_training_job(
+        app.state.db,
+        calibration_id=calibration_id,
+        adapter_dir=adapter_dir,
+        speaker_label=cal.get("display_name"),
+        log_path=log_path,
+    )
+
+    # Spawn the trainer. We use the same Python that's running FastAPI so
+    # the venv with torch/peft/transformers is guaranteed available.
+    server_root = Path(__file__).resolve().parents[1]
+    # The adapter slug derived above is what the WS handler stamps on
+    # patient utterances when this calibration's adapter is active.
+    # Pass it to the trainer so it can pull live confirmed/corrected
+    # utterances back into the training set ("feedback retraining").
+    safe_slug = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_" for ch in slug
+    ).strip("_") or f"cal_{calibration_id}"
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.train_patient_adapter",
+        "--calibration-id", str(calibration_id),
+        "--output-dir", adapter_dir,
+        "--job-id", str(job_id),
+        "--include-feedback-slug", safe_slug,
+    ]
+    if output_name:
+        cmd.extend(["--output-name", str(output_name)])
+    if extra_args:
+        cmd.extend([str(a) for a in extra_args])
+
+    try:
+        log_handle = open(log_path, "w", buffering=1)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(server_root),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _TRAINING_PROCS[job_id] = proc
+        logger.info(
+            "training job %s spawned (pid=%s, cal=%s, adapter=%s)",
+            job_id, proc.pid, calibration_id, adapter_dir,
+        )
+    except Exception as e:  # noqa: BLE001
+        from .db import update_training_job
+        update_training_job(
+            app.state.db,
+            job_id,
+            status="failed",
+            error_message=f"could not spawn trainer: {e}",
+            completed_at=time.time(),
+        )
+        raise HTTPException(500, f"could not spawn trainer: {e}") from e
+
+    # Report how many extra (audio, listener-validated text) pairs from
+    # past corrections/confirmations will be merged into the training
+    # set. The clinician sees this count so they understand the
+    # "Retrain" button isn't only using calibration prompts.
+    feedback_pairs = list_corrective_training_pairs(app.state.db, safe_slug)
+    return {
+        "job_id": job_id,
+        "calibration_id": calibration_id,
+        "adapter_dir": adapter_dir,
+        "log_path": log_path,
+        "status": "queued",
+        "calibration_clip_count": len(usable),
+        "feedback_clip_count": len(feedback_pairs),
+    }
+
+
+def _is_pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _tail_log(path: str | None, max_lines: int = 200) -> str:
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            # Cheap tail — small log files; fine to read all.
+            data = f.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        return "\n".join(lines[-max_lines:])
+    except FileNotFoundError:
+        return ""
+    except Exception as e:  # noqa: BLE001
+        return f"(could not read log: {e})"
+
+
+@app.get("/training-jobs/{job_id}")
+async def training_job_status(job_id: int) -> dict:
+    job = get_training_job(app.state.db, job_id)
+    if job is None:
+        raise HTTPException(404, f"training job {job_id} not found")
+    # Reconcile DB status with reality: if the subprocess died before
+    # writing 'succeeded' / 'failed', flip the row to 'failed' so the UI
+    # doesn't poll forever.
+    if job["status"] in ("queued", "running"):
+        pid = job.get("pid")
+        if pid is not None and not _is_pid_alive(pid):
+            from .db import update_training_job
+            update_training_job(
+                app.state.db,
+                job_id,
+                status="failed",
+                error_message=(
+                    "training process exited without writing a terminal status"
+                ),
+                completed_at=time.time(),
+            )
+            job = get_training_job(app.state.db, job_id) or job
+    job["log_tail"] = _tail_log(job.get("log_path"))
+    return job
+
+
+@app.get("/calibrations/{calibration_id}/training-jobs")
+async def training_jobs_for_calibration(calibration_id: int) -> dict:
+    if get_calibration(app.state.db, calibration_id) is None:
+        raise HTTPException(404, f"calibration {calibration_id} not found")
+    return {
+        "calibration_id": calibration_id,
+        "jobs": list_training_jobs_for_calibration(app.state.db, calibration_id),
     }
 
 
@@ -181,6 +622,23 @@ async def calibration_get(calibration_id: int) -> dict:
 async def calibration_utterance_audio(utterance_id: int) -> FileResponse:
     cur = app.state.db.execute(
         "SELECT audio_path FROM calibration_utterances WHERE id = ?",
+        (utterance_id,),
+    )
+    row = cur.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(404, "audio not available for this utterance")
+    return FileResponse(row[0], media_type="audio/wav")
+
+
+@app.get("/utterance/{utterance_id}/audio")
+async def utterance_audio(utterance_id: int) -> FileResponse:
+    """Serve the captured PCM/WAV for a live (non-calibration) utterance.
+
+    Used by the listener UI to replay what the patient actually said so the
+    listener can sanity-check the model's transcription.
+    """
+    cur = app.state.db.execute(
+        "SELECT audio_path FROM utterances WHERE id = ?",
         (utterance_id,),
     )
     row = cur.fetchone()
@@ -206,6 +664,7 @@ async def calibration_build(calibration_id: int) -> dict:
     token_to_id = extractor.processor.tokenizer.get_vocab()
 
     aligned_utterances: list[dict] = []
+    features_list: list[dict] = []
     rejected_low_score = 0
     loop = asyncio.get_running_loop()
 
@@ -217,6 +676,21 @@ async def calibration_build(calibration_id: int) -> dict:
             audio = audio[:, 0]
         if sr != settings.sample_rate:
             continue
+
+        # Prosody baseline samples — collected over every calibration
+        # utterance the patient produced, so the runtime emergency / emotion
+        # detectors can threshold relative to the patient's normal speech.
+        try:
+            feats = await loop.run_in_executor(
+                None, feat_mod.extract, audio, settings.sample_rate
+            )
+            features_list.append(feats.to_json())
+        except Exception:  # noqa: BLE001 — baseline is best-effort
+            logger.debug(
+                "calibration: features.extract failed for utt=%s",
+                row.get("id"),
+                exc_info=True,
+            )
 
         probs = await loop.run_in_executor(
             None, extractor.extract, audio, settings.sample_rate
@@ -259,7 +733,11 @@ async def calibration_build(calibration_id: int) -> dict:
             }
         )
 
-    profile = build_profile(aligned_utterances, vocab_symbols=vocab)
+    profile = build_profile(
+        aligned_utterances,
+        vocab_symbols=vocab,
+        features_list=features_list,
+    )
     profile_payload = json.loads(profile.to_json())
 
     # Optional Opus pass — only if an API key is configured.
@@ -570,13 +1048,42 @@ async def get_progress(
     }
 
 
+def _split_for_clip(
+    clip_id: int,
+    speaker_id: str,
+    eval_frac: float = 0.2,
+    seed: int = 42,
+) -> str:
+    """Deterministic cal/eval bucket for a TORGO clip.
+
+    Mirror of ``scripts/splits.split_for_clip`` — duplicated here to
+    avoid a cross-package import between ``app/`` and ``scripts/``. The
+    SHA-256 hash and parameters MUST match the training script's split
+    or the train/test labels in the UI will be wrong.
+    """
+    import hashlib
+
+    key = f"{seed}|{speaker_id}|{clip_id}".encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    bucket = int.from_bytes(digest[:8], "big") / (1 << 64)
+    return "eval" if bucket < eval_frac else "cal"
+
+
 @app.get("/torgo/clips")
 async def torgo_clips(
     speaker_id: str | None = None,
     condition: str | None = None,
     limit: int = 200,
 ) -> dict:
-    return {"clips": list_torgo_clips(app.state.db, speaker_id, condition, limit)}
+    clips = list_torgo_clips(app.state.db, speaker_id, condition, limit)
+    # Decorate each clip with its train/eval split so the demo panel can
+    # show users which clips a per-speaker adapter actually trained on.
+    for c in clips:
+        try:
+            c["split"] = _split_for_clip(int(c["id"]), c["speaker_id"])
+        except (TypeError, ValueError, KeyError):
+            c["split"] = None
+    return {"clips": clips}
 
 
 @app.get("/torgo/audio/{clip_id}")
@@ -584,7 +1091,19 @@ async def torgo_audio(clip_id: int) -> FileResponse:
     clip = get_torgo_clip(app.state.db, clip_id)
     if clip is None:
         raise HTTPException(404, f"TORGO clip {clip_id} not found")
-    return FileResponse(clip["wav_path"], media_type="audio/wav")
+    # ``Vary: Origin`` tells the browser to key its cache on Origin so a
+    # no-CORS response (e.g. cached when an <audio> element loaded the
+    # file without crossorigin set) is NOT reused for a later fetch()
+    # that needs CORS headers. Without this, the browser silently
+    # serves a stale Origin-less response to fetch() and the request
+    # fails as "blocked by CORS policy" — only avoidable by disabling
+    # the cache (e.g. devtools open). Cache-Control: no-cache forces
+    # revalidation so fresh CORS headers re-attach on every request.
+    return FileResponse(
+        clip["wav_path"],
+        media_type="audio/wav",
+        headers={"Vary": "Origin", "Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/speaker/enroll/patient")
@@ -614,6 +1133,121 @@ async def enroll_patient(audio: UploadFile) -> dict:
         "label": "patient",
         "embedding_dim": int(embedding.size),
         "sample_count": int(samples.size),
+    }
+
+
+_TORGO_ID_RE = __import__("re").compile(r"^[FM]C?\d+", __import__("re").IGNORECASE)
+
+
+def _classify_adapter_dir(name: str) -> tuple[str, str, str]:
+    """Map an adapter directory name to (id, label, kind).
+
+    TORGO speakers follow ``F01`` / ``F03_balanced`` / ``FC02`` / ``M01_small_hicap``
+    — first token is the canonical speaker id. Patient adapters use the
+    full directory name as both id and (humanized) label so they don't
+    collide with TORGO speakers and patient names with underscores or
+    digits aren't mangled.
+    """
+    m = _TORGO_ID_RE.match(name)
+    if m:
+        sid = m.group(0).upper()
+        return sid, sid, "torgo"
+    # Patient adapter — humanize the slug for display, keep the raw dir
+    # name as the routing id so the resolver can locate it via exact
+    # filesystem match.
+    label = name.replace("_", " ").strip() or name
+    return name, label, "patient"
+
+
+@app.get("/adapters")
+async def list_adapters() -> dict:
+    """List per-speaker adapters available on disk.
+
+    Read-only; consumed by the home page's ProfileSelector + the clips
+    drawer. The response carries enriched entries so the UI can
+    distinguish TORGO-style speakers (F03 / FC02 / M01 — possibly with
+    variant suffixes that all roll up to one id) from patient-trained
+    adapters (full directory name is the id, prettified for display).
+
+    Response shape::
+
+        {
+          "speakers": [
+            {"id": "F03",       "label": "F03",      "kind": "torgo"},
+            {"id": "Jane_Doe",  "label": "Jane Doe", "kind": "patient"},
+            ...
+          ],
+          "adapters": [{"name": "F03_balanced", "speaker": "F03"}, ...]
+        }
+
+    Skips the unnamed default ``patient`` directory and the multi-speaker
+    ``pool_*`` adapters — neither maps to a single user-selectable profile.
+    """
+    base = Path(settings.patient_adapter_dir).parent
+    if not base.exists():
+        return {"speakers": [], "adapters": []}
+
+    speakers: dict[str, dict] = {}  # id -> {id, label, kind}
+    adapters: list[dict] = []
+    for d in sorted(base.iterdir()):
+        if not d.is_dir():
+            continue
+        if d.name == "patient" or d.name.startswith("pool_"):
+            continue
+        if not (d / "adapter_model.safetensors").exists():
+            continue
+        sid, label, kind = _classify_adapter_dir(d.name)
+        if sid not in speakers:
+            speakers[sid] = {"id": sid, "label": label, "kind": kind}
+        adapters.append({"name": d.name, "speaker": sid})
+
+    # Sort: TORGO first (alphabetical), then patients (alphabetical by label).
+    def _sort_key(s: dict) -> tuple:
+        return (0 if s["kind"] == "torgo" else 1, s["id"])
+
+    return {
+        "speakers": sorted(speakers.values(), key=_sort_key),
+        "adapters": adapters,
+    }
+
+
+@app.get("/speaker/patient")
+async def get_patient_speaker() -> dict:
+    """Return whether the patient voice has been enrolled.
+
+    Read-only; consumed by the listener UI to show a calibration-status
+    chip near the mic bar. The patient row lives at session_id IS NULL.
+
+    Also reports whether the latest patient profile carries a prosody
+    baseline (median jitter/shimmer/pauses across calibration utterances).
+    The baseline lets emergency / emotion detectors threshold on deltas
+    from this patient's normal speech rather than absolute values that
+    fire constantly on dysarthric voices.
+    """
+    row = app.state.db.execute(
+        "SELECT sample_count, created_at FROM speakers"
+        " WHERE session_id IS NULL AND label = 'patient'"
+    ).fetchone()
+
+    has_baseline = False
+    try:
+        cur = app.state.db.execute(
+            "SELECT profile_json FROM patient_profiles ORDER BY id DESC LIMIT 1"
+        )
+        latest = cur.fetchone()
+        if latest and latest[0]:
+            data = json.loads(latest[0])
+            has_baseline = isinstance(data.get("prosody_baseline"), dict)
+    except (json.JSONDecodeError, sqlite3.Error):
+        pass
+
+    if row is None:
+        return {"enrolled": False, "baseline": has_baseline}
+    return {
+        "enrolled": True,
+        "baseline": has_baseline,
+        "sample_count": int(row[0]) if row[0] is not None else None,
+        "enrolled_at": float(row[1]) if row[1] is not None else None,
     }
 
 
@@ -671,26 +1305,126 @@ async def ws_audio(websocket: WebSocket) -> None:
                          through the calibrated pipeline regardless of who's
                          enrolled.
     """
+    bypass_vad = (
+        websocket.query_params.get("bypass_vad", "0") in ("1", "true", "yes")
+    )
     force_patient = (
         websocket.query_params.get("force_patient", "0") in ("1", "true", "yes")
     )
+    # When demo mode streams a TORGO clip we know the speaker id up front
+    # (e.g. F03), so the runtime can pin the matching per-speaker adapter
+    # for that session instead of the default. Falls back to the default
+    # adapter if no matching directory exists on disk.
+    requested_adapter_speaker = websocket.query_params.get("adapter_speaker")
+    loaded_bases = set(getattr(websocket.app.state, "bases", {}).keys())
+    adapter_override = _resolve_adapter_dir(
+        requested_adapter_speaker, loaded_bases=loaded_bases
+    )
+
+    # Pick the gate that matches the resolved adapter's base model. Each
+    # base loaded at lifespan has its own AdaptedTranscriber + gate; the
+    # M01 medium adapter wants the medium gate, the F03 / FC02 small
+    # adapters want the small gate. Falls back to the default gate when
+    # no adapter is resolved (live mic without adapter_speaker) or the
+    # adapter's base happens to match the default anyway.
+    gate: GatedTranscriber = websocket.app.state.gate
+    selected_base: str | None = None
+    if adapter_override:
+        try:
+            cand_marker = Path(adapter_override) / "BASE_MODEL.txt"
+            if cand_marker.exists():
+                cand_base = cand_marker.read_text().strip()
+                if cand_base in websocket.app.state.bases:
+                    gate = websocket.app.state.bases[cand_base]["gate"]
+                    selected_base = cand_base
+        except OSError:
+            pass
+
     await websocket.accept()
     logger.info(
-        "WS /ws/audio accepted (force_patient=%s) from %s",
+        "WS /ws/audio accepted (force_patient=%s, adapter=%s, base=%s) from %s",
         force_patient,
+        adapter_override or "default",
+        selected_base or "default",
         websocket.client,
     )
 
     extractor: PhonemeExtractor = websocket.app.state.extractor
     speaker_id: SpeakerIdentifier = websocket.app.state.speaker
     transcriber: Transcriber = websocket.app.state.transcriber
-    gate: GatedTranscriber = websocket.app.state.gate
     db = websocket.app.state.db
 
     session_id = create_session(db)
     logger.info("Session %d started", session_id)
 
-    context = ContextManager(session_id=session_id, max_recent=settings.translation_recent_utterances)
+    # Per-stream diagnostic timeline. Each WS connection gets its own
+    # millisecond-anchored timeline that's emitted as ``diag`` messages
+    # over the same WS. The frontend collects these per-stream so the
+    # user can copy a compact, deterministic log instead of slogging
+    # through the server's stdout (which is interleaved with model-load
+    # noise, lifespan boilerplate, and any concurrent sessions).
+    diag_t0 = time.time()
+
+    async def diag(msg: str, level: str = "info", **data) -> None:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "diag",
+                        "session_id": session_id,
+                        "ts_ms": int((time.time() - diag_t0) * 1000),
+                        "level": level,
+                        "msg": msg,
+                        "data": data or None,
+                    }
+                )
+            )
+        except Exception:
+            # WS may already be closed (e.g. client disconnected before
+            # we finished an in-flight diag). Silent — these are
+            # diagnostic-only, not load-bearing.
+            pass
+
+    await diag(
+        "stream opened",
+        force_patient=force_patient,
+        adapter=adapter_override or "default",
+        speaker_requested=requested_adapter_speaker or None,
+        bypass_vad=bypass_vad,
+    )
+
+    # Load the most recent patient profile's prosody baseline (across all
+    # calibrations). Used to threshold emergency alerts and emotional-state
+    # computations on DELTAS from this patient's normal voice quality
+    # rather than absolute values that are naturally elevated by
+    # dysarthria. None when no calibration has been completed yet — in
+    # that case the absolute fallback thresholds in check_prosody apply.
+    prosody_baseline: dict | None = None
+    try:
+        cur = db.execute(
+            "SELECT profile_json FROM patient_profiles ORDER BY id DESC LIMIT 1"
+        )
+        latest = cur.fetchone()
+        if latest and latest[0]:
+            data = json.loads(latest[0])
+            pb = data.get("prosody_baseline")
+            if isinstance(pb, dict):
+                prosody_baseline = pb
+                logger.info(
+                    "Session %d loaded prosody baseline (n=%s, jitter=%.3f, shimmer=%.3f)",
+                    session_id,
+                    pb.get("n_samples"),
+                    pb.get("jitter_p50", 0),
+                    pb.get("shimmer_p50", 0),
+                )
+    except (json.JSONDecodeError, sqlite3.Error):
+        logger.debug("could not load patient prosody baseline", exc_info=True)
+
+    context = ContextManager(
+        session_id=session_id,
+        max_recent=settings.translation_recent_utterances,
+        prosody_baseline=prosody_baseline,
+    )
     upsert_session_metadata(
         db, session_id=session_id, time_of_day=context.metadata.time_of_day
     )
@@ -746,6 +1480,14 @@ async def ws_audio(websocket: WebSocket) -> None:
         name = f"sess{session_id}_{utt.start_ms:08d}_{int(time.time()*1000)}"
         audio_path = save_wav(utt.audio, settings.sample_rate, settings.audio_dir, name)
         is_patient = match.label == "patient"
+        # Stamp the active adapter slug on patient utterances so the
+        # trainer can later pull confirmed/corrected ones back into the
+        # training set for the same patient (feedback retraining).
+        utt_adapter_slug = (
+            requested_adapter_speaker
+            if is_patient and requested_adapter_speaker
+            else None
+        )
         utt_id = create_utterance(
             db,
             session_id=session_id,
@@ -756,6 +1498,7 @@ async def ws_audio(websocket: WebSocket) -> None:
             speaker_similarity=match.similarity,
             is_patient=is_patient,
             audio_path=audio_path,
+            adapter_slug=utt_adapter_slug,
         )
 
         await websocket.send_text(
@@ -776,7 +1519,8 @@ async def ws_audio(websocket: WebSocket) -> None:
 
         if is_patient:
             await _process_patient(
-                websocket, loop, extractor, gate, db, context, session_id, utt_id, utt, frame_stride_ms
+                websocket, loop, extractor, gate, db, context, session_id,
+                utt_id, utt, frame_stride_ms, adapter_dir=adapter_override,
             )
         else:
             await _process_other(websocket, loop, transcriber, db, context, session_id, utt_id, utt)
@@ -790,6 +1534,17 @@ async def ws_audio(websocket: WebSocket) -> None:
             logger.debug("failed to emit context snapshot", exc_info=True)
 
     bytes_received = 0
+    # When ``bypass_vad=1`` (TORGO panel use case: the streamed WAV file is
+    # known to be a single intended utterance), we skip the silero VAD
+    # segmenter entirely. PCM bytes accumulate into ``vad_bypass_buf`` and
+    # the whole buffer is processed as one Utterance in the finally block.
+    # Solves: silero VAD was non-deterministic on chunked realtime streams
+    # of dysarthric speech — same TORGO clip, different VAD splits across
+    # runs, producing wildly different transcripts (e.g. M01 "The islands
+    # are sparsely populated" → "silent sun" in one run, full sentence in
+    # the next). For pre-recorded clips we already know the full audio is
+    # one utterance, so VAD is the wrong layer.
+    vad_bypass_buf = bytearray() if bypass_vad else None
     try:
         while True:
             message = await websocket.receive()
@@ -801,13 +1556,25 @@ async def ws_audio(websocket: WebSocket) -> None:
                 if bytes_received == 0:
                     logger.info("WS session %d first PCM bytes arrived (%d B)",
                                 session_id, len(raw))
+                    await diag(
+                        "first PCM bytes arrived", bytes=len(raw),
+                        bypass_vad=bypass_vad,
+                    )
                 bytes_received += len(raw)
-                segmenter.append_pcm16(raw)
-                for utt in list(segmenter.utterances()):
-                    logger.info("WS session %d emitting utterance %d–%d ms (%.1fs audio)",
-                                session_id, utt.start_ms, utt.end_ms,
-                                utt.audio.size / settings.sample_rate)
-                    await handle_utterance(utt)
+                if vad_bypass_buf is not None:
+                    vad_bypass_buf.extend(raw)
+                else:
+                    segmenter.append_pcm16(raw)
+                    for utt in list(segmenter.utterances()):
+                        logger.info("WS session %d emitting utterance %d–%d ms (%.1fs audio)",
+                                    session_id, utt.start_ms, utt.end_ms,
+                                    utt.audio.size / settings.sample_rate)
+                        await diag(
+                            "VAD emitted utterance",
+                            start_ms=utt.start_ms, end_ms=utt.end_ms,
+                            duration_ms=int(utt.audio.size / settings.sample_rate * 1000),
+                        )
+                        await handle_utterance(utt)
                 continue
 
             text = message.get("text")
@@ -819,6 +1586,7 @@ async def ws_audio(websocket: WebSocket) -> None:
                 if payload.get("type") == "stop":
                     logger.info("WS session %d received stop after %d B",
                                 session_id, bytes_received)
+                    await diag("stop received", bytes=bytes_received)
                     break
     except WebSocketDisconnect:
         logger.info("WS session %d disconnected after %d B", session_id, bytes_received)
@@ -826,16 +1594,51 @@ async def ws_audio(websocket: WebSocket) -> None:
         logger.exception("Unexpected error in session %d", session_id)
     finally:
         flushed = 0
-        for utt in list(segmenter.flush()):
+        if vad_bypass_buf is not None and len(vad_bypass_buf) > 0:
+            # Bypass path: emit the entire accumulated PCM buffer as a
+            # single utterance. No VAD trimming — caller (TORGO panel)
+            # guaranteed the buffer is one intended utterance.
+            audio = np.frombuffer(bytes(vad_bypass_buf), dtype=np.int16).astype(
+                np.float32
+            ) / 32768.0
+            duration_ms = int(audio.size / settings.sample_rate * 1000)
+            utt = Utterance(start_ms=0, end_ms=duration_ms, audio=audio)
             try:
-                flushed += 1
-                logger.info("WS session %d flushing trailing utterance %d–%d ms",
-                            session_id, utt.start_ms, utt.end_ms)
+                flushed = 1
+                logger.info(
+                    "WS session %d bypass_vad — single utterance %.1fs (%d B PCM)",
+                    session_id, duration_ms / 1000, len(vad_bypass_buf),
+                )
+                await diag(
+                    "bypass_vad: emitting single utterance",
+                    duration_ms=duration_ms, bytes=len(vad_bypass_buf),
+                )
                 await handle_utterance(utt)
             except Exception:
-                logger.exception("Failed to flush trailing utterance")
+                logger.exception("Failed to process bypass_vad utterance")
+        else:
+            for utt in list(segmenter.flush()):
+                try:
+                    flushed += 1
+                    logger.info("WS session %d flushing trailing utterance %d–%d ms",
+                                session_id, utt.start_ms, utt.end_ms)
+                    await diag(
+                        "flushing trailing utterance",
+                        start_ms=utt.start_ms, end_ms=utt.end_ms,
+                        duration_ms=int(utt.audio.size / settings.sample_rate * 1000),
+                    )
+                    await handle_utterance(utt)
+                except Exception:
+                    logger.exception("Failed to flush trailing utterance")
         logger.info("WS session %d closing (received %d B, flushed %d trailing utterance(s))",
                     session_id, bytes_received, flushed)
+        try:
+            await diag(
+                "stream closing", bytes=bytes_received,
+                trailing_utterances=flushed,
+            )
+        except Exception:
+            pass
         # Mark any unanswered questions as stale.
         mark_questions_answered(db, session_id)
         end_session(db, session_id)
@@ -860,6 +1663,7 @@ async def _process_patient(
     utterance_id: int,
     utt: Utterance,
     frame_stride_ms: int,
+    adapter_dir: str | None = None,
 ) -> None:
     # Phoneme distributions over the whole utterance.
     probs = await loop.run_in_executor(
@@ -908,7 +1712,9 @@ async def _process_patient(
     write_emotion_snapshot(db, session_id, emotion["frustration"], emotion["distress"])
 
     # Pre-LLM emergency check on prosody alone — fires even if translation fails.
-    prosody_alert = check_prosody(payload, emotion)
+    prosody_alert = check_prosody(
+        payload, emotion, baseline=context.get_prosody_baseline()
+    )
     if prosody_alert.triggered:
         await websocket.send_text(
             json.dumps(
@@ -931,7 +1737,17 @@ async def _process_patient(
     # where alignment evidence doesn't support it.
     try:
         await _gate_and_emit(
-            websocket, loop, gate, db, context, session_id, utterance_id, utt, probs,
+            websocket, loop, gate, db, context, session_id, utterance_id,
+            utt, probs, adapter_dir=adapter_dir,
+        )
+    except WebSocketDisconnect:
+        # Client closed the socket while the gate was still decoding /
+        # the executor was finishing. This is the normal "stop mic before
+        # the in-flight utterance finishes" flow. Log briefly without a
+        # stack trace so it doesn't look like a real failure.
+        logger.info(
+            "WS closed before utt=%s could be emitted (in-flight cancel)",
+            utterance_id,
         )
     except Exception as e:
         logger.exception("gated transcription failed for utt=%s", utterance_id)
@@ -960,6 +1776,7 @@ async def _gate_and_emit(
     utterance_id: int,
     utt: Utterance,
     probs: np.ndarray,
+    adapter_dir: str | None = None,
 ) -> None:
     """Run Whisper + phoneme-alignment gate, persist, emit to client.
 
@@ -979,22 +1796,76 @@ async def _gate_and_emit(
     gated = await loop.run_in_executor(
         None,
         lambda: gate.transcribe_with_gate(
-            utt.audio, probs=probs, initial_prompt=initial_prompt,
+            utt.audio,
+            probs=probs,
+            initial_prompt=initial_prompt,
+            adapter_dir=adapter_dir,
         ),
     )
-    # Map the gate's binary verdict into the existing per-translation
-    # confidence range so downstream UI rendering keeps working.
-    overall_conf = 0.25 if gated.flagged else 0.85
+    # Real per-word + overall confidence derived from the gate's
+    # phoneme-alignment scores — the geometric mean per-frame phoneme
+    # probability for each word, i.e. exp(mean log-prob). Words whose
+    # phonemes all got dropped by the vocab filter (rare, after the
+    # compound-split rules in vocab.py these are mostly proper nouns)
+    # fall back to the overall confidence rather than 0.0 — reporting
+    # 0% would imply "definitely wrong" when the truth is "we have no
+    # signal for this word."
+    overall_conf = (
+        max(0.0, min(1.0, math.exp(gated.align_score)))
+        if math.isfinite(gated.align_score) else 0.0
+    )
+    per_word_conf = [
+        max(0.0, min(1.0, math.exp(s))) if math.isfinite(s) else overall_conf
+        for s in gated.per_word_scores
+    ]
+    # UI-level low-confidence override. The phoneme-alignment gate can be
+    # fooled by under-production cases where a short transcript phonetically
+    # aligns to *part* of the audio while leaving most of it unaccounted
+    # for (diagnostic: "The islands are sparsely populated" → "the island
+    # arts.", align_score -0.2, dur 2.85 s, only 11 phonemes emitted).
+    # The per-word/overall confidences computed above *do* see the issue
+    # — they're uniformly mediocre on these cases. Promote that signal
+    # into the same `flagged` field the UI consumes for the red ring, so
+    # listeners get the low-trust treatment even when the gate didn't
+    # structurally trip.
+    # Per-patient UI low-confidence threshold. When the active adapter
+    # carries a ``calibration.json``, use its
+    # ``ui_low_confidence_threshold`` instead of the global default —
+    # M01's natural overall_conf distribution sits much lower than
+    # FC02's, so a single global threshold over- or under-flags one of
+    # them. The gate exposes the patient-specific value via
+    # ``get_calibration_thresholds``; fall back to global when not set.
+    # When no explicit ``adapter_dir`` is set (live mic stream), consult
+    # the default patient adapter's calibration so the live path also
+    # gets per-patient thresholds.
+    cal_thresholds = gate.get_calibration_thresholds(
+        adapter_dir or settings.patient_adapter_dir
+    )
+    ui_low_conf_threshold = float(
+        cal_thresholds.get(
+            "ui_low_confidence_threshold",
+            settings.ui_low_confidence_threshold,
+        )
+    )
+    ui_flagged = gated.flagged
+    ui_reason = gated.reason
+    if (
+        not ui_flagged
+        and overall_conf < ui_low_conf_threshold
+        and gated.text
+    ):
+        ui_flagged = True
+        ui_reason = "low_confidence"
     write_translation(
         db,
         utterance_id=utterance_id,
         primary=gated.text,
         alternatives=[],
-        per_word_confidence=[],
+        per_word_confidence=per_word_conf,
         overall_confidence=overall_conf,
         emergency=False,
         context_hints=[
-            f"flagged: {gated.reason}" if gated.reason else "phoneme-aligned"
+            f"flagged: {ui_reason}" if ui_reason else "phoneme-aligned"
         ],
         model="whisper+phoneme-gate",
         usage={
@@ -1011,13 +1882,15 @@ async def _gate_and_emit(
                 "utterance_id": utterance_id,
                 "primary": gated.text,
                 "alternatives": [],
-                "per_word_confidence": [],
+                "per_word_confidence": per_word_conf,
                 "overall_confidence": overall_conf,
                 "emergency": False,
                 "context_hints": [],
-                # New gate-specific fields. Frontend renders red border on flagged.
-                "flagged": gated.flagged,
-                "reason": gated.reason,
+                # Frontend renders red border when flagged. We forward the
+                # UI-promoted `ui_flagged` here (the gate's verdict OR the
+                # low-confidence override), not the raw gate field.
+                "flagged": ui_flagged,
+                "reason": ui_reason,
                 "align_score": gated.align_score,
                 "phoneme_density": gated.phoneme_density,
             }
@@ -1027,7 +1900,9 @@ async def _gate_and_emit(
     # Only feed un-flagged text into the conversational context window.
     # A flagged transcription is by definition untrusted; we shouldn't
     # let it bias the topic tracker or pending-question matching.
-    if not gated.flagged and gated.text:
+    # Uses the UI-promoted flag so low-confidence outputs are likewise
+    # withheld from the topic / question trackers.
+    if not ui_flagged and gated.text:
         context_mgr.observe_patient(gated.text)
 
     # Layer-6 emergency cross-check on text. Priority terms (pain, help,
@@ -1119,6 +1994,94 @@ def _label_from_utterance(db, utterance_id: int) -> str | None:
     )
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def _resolve_adapter_dir(
+    speaker_id: str | None,
+    loaded_bases: set[str] | None = None,
+) -> str | None:
+    """Map a TORGO speaker id to its preferred adapter directory.
+
+    Looks under the parent of ``settings.patient_adapter_dir`` (i.e.
+    ``data/adapters/``) and matches directories whose leading speaker
+    token equals ``speaker_id`` (case-insensitive). Filters by base-
+    model compatibility: only adapters whose ``BASE_MODEL.txt`` is in
+    ``loaded_bases`` are considered (an adapter whose base isn't loaded
+    can't be served, and PEFT shape-mismatch silently degrades to the
+    default — see the legacy whisper-tiny.en M01 misload incident).
+
+    ``loaded_bases`` defaults to ``{<live default base>}`` to preserve
+    the old single-base behavior for callers that haven't been updated
+    to the multi-base lifespan. With multi-base loaded (e.g. small.en
+    + medium.en), this allows M01 streams to pick up the medium
+    adapter while F03 / FC02 stay on small adapters.
+
+    When multiple compatible candidates exist, prefers the most
+    recently-trained one (mtime descending). Returns ``None`` if no
+    compatible adapter is on disk — callers fall back to the default.
+    """
+    if not speaker_id:
+        return None
+    base = Path(settings.patient_adapter_dir).parent
+    if not base.exists():
+        return None
+
+    if loaded_bases is None or not loaded_bases:
+        # Backward-compat: single-base mode. Read the default's marker.
+        live_base: str | None = None
+        default_marker = Path(settings.patient_adapter_dir) / "BASE_MODEL.txt"
+        if default_marker.exists():
+            try:
+                live_base = default_marker.read_text().strip() or None
+            except OSError:
+                live_base = None
+        loaded_bases = {live_base} if live_base else set()
+
+    def _base_ok(d: Path) -> bool:
+        if not loaded_bases:
+            # No constraint — accept anything.
+            return True
+        cand_marker = d / "BASE_MODEL.txt"
+        if not cand_marker.exists():
+            # Legacy adapter without marker: accept (failure mode
+            # would surface as a PEFT shape error, which we'll log).
+            return True
+        try:
+            return cand_marker.read_text().strip() in loaded_bases
+        except OSError:
+            return False
+
+    # No fast-path "exact match". An exact bare-name match (e.g.
+    # ``data/adapters/M01`` referring to a *legacy* whisper-tiny.en
+    # adapter) would short-circuit the newest-wins loop below and
+    # return the worse adapter when a newer suffixed sibling like
+    # ``M01_medium_hicap`` exists. We always enumerate candidates and
+    # sort by mtime.
+    speaker_upper = speaker_id.upper()
+    candidates: list[Path] = []
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name == "patient" or d.name.startswith("pool_"):
+            continue
+        if not (d / "adapter_model.safetensors").exists():
+            continue
+        if d.name.split("_", 1)[0].upper() != speaker_upper:
+            continue
+        if not _base_ok(d):
+            logger.debug(
+                "Skipping adapter %s (base not in loaded_bases=%s)",
+                d, loaded_bases,
+            )
+            continue
+        candidates.append(d)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda d: (d / "adapter_model.safetensors").stat().st_mtime,
+        reverse=True,
+    )
+    return str(candidates[0])
 
 
 # =============================================================== utilities

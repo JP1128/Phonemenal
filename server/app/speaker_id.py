@@ -1,4 +1,10 @@
-"""Speaker identification via SpeechBrain ECAPA-TDNN embeddings."""
+"""Speaker identification via SpeechBrain ECAPA-TDNN embeddings.
+
+NOTE: This file backs slide 3 of ``client/app/how-it-works/page.tsx``. If
+you change the embedding model or the match/reject thresholds in
+``settings``, update the SimilarityMeter props on that slide. See CLAUDE.md
+("Documentation invariant").
+"""
 from __future__ import annotations
 
 import io

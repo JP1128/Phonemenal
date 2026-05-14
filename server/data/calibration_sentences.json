@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "sets": [
     {
       "id": "basic_needs",
@@ -15,7 +15,17 @@
         "I am hot.",
         "Please bring my glasses.",
         "Please bring my phone.",
-        "I am ready to sleep."
+        "I am ready to sleep.",
+        "I need a blanket.",
+        "Can you adjust the bed.",
+        "Please open the window.",
+        "Please close the curtain.",
+        "I would like to brush my teeth.",
+        "Please bring me a tissue.",
+        "I need help getting dressed.",
+        "Can someone help me stand up.",
+        "I want to make a phone call.",
+        "Please turn off the television."
       ]
     },
     {
@@ -32,7 +42,17 @@
         "When do I take my medicine.",
         "Yes that helps.",
         "No that makes it worse.",
-        "Where is the bathroom."
+        "Where is the bathroom.",
+        "My stomach feels sick.",
+        "My back is sore.",
+        "My left leg is numb.",
+        "My throat hurts when I swallow.",
+        "The medicine is making me sleepy.",
+        "I have a fever.",
+        "I feel weak today.",
+        "I had trouble sleeping last night.",
+        "I need a glass of water with my pills.",
+        "Has the doctor visited this morning."
       ]
     },
     {
@@ -49,24 +69,130 @@
         "I am sorry.",
         "I am tired today.",
         "I feel hopeful.",
-        "I do not feel well."
+        "I do not feel well.",
+        "I feel grateful for everything.",
+        "I am proud of my progress.",
+        "Today was a good day.",
+        "I want to go home soon.",
+        "Please tell my children I love them.",
+        "I am worried about the surgery.",
+        "I feel much better than yesterday.",
+        "I appreciate your kindness.",
+        "I am embarrassed to ask for help.",
+        "Some days are harder than others."
       ]
     },
     {
       "id": "common_sounds",
-      "label": "Common Sounds",
-      "description": "TIMIT-style sentences chosen to cover the English phoneme inventory.",
+      "label": "Phoneme-balanced Sentences",
+      "description": "TIMIT-style sentences chosen so the combined set covers every English phoneme. Reading these gives the trainer good coverage even with a modest clip count.",
       "sentences": [
         "She had your dark suit in greasy wash water all year.",
         "Don't ask me to carry an oily rag like that.",
         "The quick brown fox jumps over the lazy dog.",
-        "How are you feeling today.",
-        "I would like a cup of tea.",
-        "The sun is shining outside.",
-        "Birds are singing in the garden.",
         "Pack my box with five dozen liquor jugs.",
-        "Please pass the salt and pepper.",
-        "Can you turn the light on."
+        "Sphinx of black quartz, judge my vow.",
+        "Two driven jocks help fax my big quiz.",
+        "How quickly daft jumping zebras vex.",
+        "The five boxing wizards jump quickly.",
+        "Bright vixens jump; dozy fowl quack.",
+        "Glib jocks quiz nymph to vex dwarf.",
+        "Jackdaws love my big sphinx of quartz.",
+        "Cozy lummox gives smart squid who asks for job pen.",
+        "A wizard's job is to vex chumps quickly in fog.",
+        "Watch Jeopardy alex Trebek's fun TV quiz game.",
+        "Crazy Fredrick bought many very exquisite opal jewels.",
+        "Few thoughts arise during my brief calm sleep.",
+        "Many roads have splendid views in the morning fog.",
+        "Bring sturdy yellow umbrellas when the weather turns.",
+        "Children playfully chased the noisy ducks across the pond.",
+        "Eleven musicians performed jazz songs beside the bonfire.",
+        "Cathy was charging the phone with the new red cord.",
+        "Soft music plays in the background of the doctor's office.",
+        "The therapist asked her to count slowly from one to ten.",
+        "We saved a place near the window for grandfather to sit.",
+        "Yesterday I drank a tall glass of lemonade in the shade."
+      ]
+    },
+    {
+      "id": "phoneme_drills",
+      "label": "Phoneme Drills",
+      "description": "Short minimal-pair and stress-pattern drills that exercise consonants the patient adapter struggles with most. Quick reps, low cognitive load.",
+      "sentences": [
+        "Red lorry, yellow lorry, red lorry, yellow lorry.",
+        "Peter Piper picked a peck of pickled peppers.",
+        "She sells seashells by the seashore.",
+        "How much wood would a woodchuck chuck.",
+        "Around the rugged rock the ragged rascal ran.",
+        "A proper copper coffee pot.",
+        "Toy boat, toy boat, toy boat.",
+        "Unique New York, unique New York.",
+        "Black bug bit a big black bear.",
+        "Six slick slim slender saplings.",
+        "Truly rural, truly rural, truly rural.",
+        "Eleven benevolent elephants.",
+        "Greek grapes, Greek grapes, Greek grapes.",
+        "Irish wristwatch, Swiss wristwatch.",
+        "Mixed biscuits, mixed biscuits, mixed biscuits.",
+        "Pad kid poured curd pulled cold.",
+        "Fresh french fried fish.",
+        "Lesser leather never weathered wetter weather.",
+        "Sheep should sleep in a shed.",
+        "Three free throws."
+      ]
+    },
+    {
+      "id": "conversational",
+      "label": "Conversational",
+      "description": "Natural everyday sentences with broad coverage of common function words and contractions, which is where ASR usually pays off most.",
+      "sentences": [
+        "What time is dinner today.",
+        "Could you turn the heat up a little.",
+        "I'd like to call my daughter later.",
+        "Do you remember where you put my book.",
+        "I'm not sure I understood what you said.",
+        "It was raining when I woke up this morning.",
+        "Can we walk in the garden after lunch.",
+        "I'll try to do that exercise again tomorrow.",
+        "She brought the photo album from the closet.",
+        "He hasn't answered the phone all afternoon.",
+        "We watched the news together last night.",
+        "There's a new nurse on the evening shift.",
+        "I always took the long way home from school.",
+        "I'd rather rest now and try again later.",
+        "Did the physical therapist say when I can stand.",
+        "I keep forgetting what day of the week it is.",
+        "The window faces east so the sun wakes me early.",
+        "My grandson visited me on Saturday afternoon.",
+        "The coffee tastes much better this morning.",
+        "Could you read that letter out loud one more time.",
+        "I haven't been outside in three days.",
+        "I'm hoping the rain stops by the weekend.",
+        "The hospital food is better than I expected.",
+        "Tell me again about the trip you took last summer.",
+        "I keep thinking about that song from when I was young."
+      ]
+    },
+    {
+      "id": "numbers_and_dates",
+      "label": "Numbers and Dates",
+      "description": "Number and date pronunciations are an outsized share of medical communication failures (medication times, room numbers). Worth giving the adapter explicit coverage.",
+      "sentences": [
+        "Today is the fifteenth of November.",
+        "My next appointment is at three forty-five.",
+        "I take two pills every six hours.",
+        "Room four oh seven.",
+        "I was born in nineteen forty-two.",
+        "It's been nineteen days since the surgery.",
+        "I take one tablet of the white pill at eight in the morning.",
+        "I weigh one hundred and sixty pounds.",
+        "Please call my son, his number is four one five, five five five, zero one two seven.",
+        "I take the smaller pill at noon and the larger one at six in the evening.",
+        "It is now seventeen minutes past two.",
+        "My birthday is on October the third.",
+        "The dose is twenty-five milligrams, twice a day.",
+        "We have lived at this address for thirty-one years.",
+        "The thermostat should stay around seventy-two degrees."
       ]
     }
   ]

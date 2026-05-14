@@ -67,7 +67,11 @@ CREATE TABLE IF NOT EXISTS calibrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at REAL NOT NULL,
     completed_at REAL,
-    notes TEXT
+    notes TEXT,
+    -- Human-readable patient label (e.g. "Jane Doe", "Bed 4"). Optional
+    -- so existing rows remain valid. Set when the calibration is started
+    -- and shown in the UI's resume list / profile selector.
+    display_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS calibration_utterances (
@@ -86,6 +90,39 @@ CREATE TABLE IF NOT EXISTS calibration_utterances (
     FOREIGN KEY (calibration_id) REFERENCES calibrations(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_cal_utt_cal ON calibration_utterances (calibration_id);
+
+CREATE TABLE IF NOT EXISTS training_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    calibration_id INTEGER NOT NULL,
+    -- Adapter directory the trainer will (or did) write to.
+    -- Once status='succeeded' this directory is what /adapters lists.
+    adapter_dir TEXT NOT NULL,
+    -- Display name resolved at job-creation time (e.g. "Bed 4 — Jane Doe").
+    -- Stored separately from `calibrations.display_name` so renaming a
+    -- calibration doesn't retroactively change the trained adapter's label.
+    speaker_label TEXT,
+    -- "queued" → row exists, subprocess not yet started.
+    -- "running" → subprocess started, status periodically updated.
+    -- "succeeded" → training + save completed, adapter on disk.
+    -- "failed" → subprocess errored or crashed.
+    status TEXT NOT NULL DEFAULT 'queued',
+    -- PID of the training subprocess. Useful for liveness checks.
+    pid INTEGER,
+    -- Absolute path to the captured stdout/stderr log. tail of this is
+    -- what the UI displays as live progress.
+    log_path TEXT,
+    -- JSON summary of held-out evaluation when the job succeeds
+    -- (WER, n_clips, etc). Null while running.
+    eval_summary_json TEXT,
+    -- Plain error message when status='failed' so the UI can show it
+    -- without having to parse the log.
+    error_message TEXT,
+    started_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+    completed_at REAL,
+    FOREIGN KEY (calibration_id) REFERENCES calibrations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_cal
+    ON training_jobs (calibration_id);
 
 CREATE TABLE IF NOT EXISTS patient_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,7 +268,33 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Apply additive schema migrations for tables that already existed
+    before a new column was introduced. ``CREATE TABLE IF NOT EXISTS`` is
+    a no-op on the existing table, so additive columns need an explicit
+    ALTER. Each migration is idempotent — runs at every startup.
+    """
+    cal_cols = {row[1] for row in conn.execute("PRAGMA table_info(calibrations)").fetchall()}
+    if "display_name" not in cal_cols:
+        conn.execute("ALTER TABLE calibrations ADD COLUMN display_name TEXT")
+        conn.commit()
+
+    # adapter_slug records the per-patient adapter that was active when
+    # this utterance was processed. Lets the trainer later pull live
+    # utterances that have been confirmed/corrected back into the
+    # training set for the same patient ("feedback retraining").
+    utt_cols = {row[1] for row in conn.execute("PRAGMA table_info(utterances)").fetchall()}
+    if "adapter_slug" not in utt_cols:
+        conn.execute("ALTER TABLE utterances ADD COLUMN adapter_slug TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_utterances_adapter_slug"
+            " ON utterances (adapter_slug)"
+        )
+        conn.commit()
 
 
 # ----------------------------------------------------------------- sessions
@@ -267,12 +330,13 @@ def create_utterance(
     speaker_similarity: float | None,
     is_patient: bool,
     audio_path: str | None,
+    adapter_slug: str | None = None,
 ) -> int:
     cur = conn.execute(
         "INSERT INTO utterances"
         " (session_id, start_ms, end_ms, speaker_label, speaker_role,"
-        "  speaker_similarity, is_patient, audio_path)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "  speaker_similarity, is_patient, audio_path, adapter_slug)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
             start_ms,
@@ -282,6 +346,7 @@ def create_utterance(
             speaker_similarity,
             1 if is_patient else 0,
             audio_path,
+            adapter_slug,
         ),
     )
     conn.commit()
@@ -414,10 +479,15 @@ def list_torgo_clips(
 # --------------------------------------------------------------- calibration
 
 
-def create_calibration(conn: sqlite3.Connection, notes: str | None = None) -> int:
+def create_calibration(
+    conn: sqlite3.Connection,
+    notes: str | None = None,
+    display_name: str | None = None,
+) -> int:
     cur = conn.execute(
-        "INSERT INTO calibrations (started_at, notes) VALUES (?, ?)",
-        (time.time(), notes),
+        "INSERT INTO calibrations (started_at, notes, display_name)"
+        " VALUES (?, ?, ?)",
+        (time.time(), notes, display_name),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -429,6 +499,176 @@ def complete_calibration(conn: sqlite3.Connection, calibration_id: int) -> None:
         (time.time(), calibration_id),
     )
     conn.commit()
+
+
+def get_calibration(
+    conn: sqlite3.Connection, calibration_id: int
+) -> dict | None:
+    cur = conn.execute(
+        "SELECT id, started_at, completed_at, notes, display_name"
+        " FROM calibrations WHERE id = ?",
+        (calibration_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row[0]),
+        "started_at": float(row[1]),
+        "completed_at": float(row[2]) if row[2] is not None else None,
+        "notes": row[3],
+        "display_name": row[4],
+    }
+
+
+def list_calibrations(conn: sqlite3.Connection) -> list[dict]:
+    """All calibrations + their utterance count and latest training job,
+    newest first.
+
+    Used by the resume-or-start UI so the doctor can see in-progress
+    patients ("Jane Doe — 34 clips") instead of always starting fresh,
+    plus whether an adapter already exists for that patient
+    ("trained ✓" badge) or training is currently running.
+
+    The training-job join takes the row with the highest id per
+    calibration (training_jobs.id is autoincrement, so highest id ==
+    most recent submission). LEFT JOIN keeps calibrations that have
+    never been trained.
+    """
+    cur = conn.execute(
+        "SELECT c.id, c.started_at, c.completed_at, c.notes, c.display_name,"
+        " (SELECT COUNT(*) FROM calibration_utterances u"
+        "    WHERE u.calibration_id = c.id) AS utterance_count,"
+        " tj.id, tj.status, tj.adapter_dir, tj.completed_at"
+        " FROM calibrations c"
+        " LEFT JOIN training_jobs tj"
+        "   ON tj.id = (SELECT MAX(id) FROM training_jobs"
+        "                WHERE calibration_id = c.id)"
+        " ORDER BY c.started_at DESC",
+    )
+    rows = cur.fetchall()
+    return [
+        {
+            "id": int(r[0]),
+            "started_at": float(r[1]),
+            "completed_at": float(r[2]) if r[2] is not None else None,
+            "notes": r[3],
+            "display_name": r[4],
+            "utterance_count": int(r[5] or 0),
+            "last_training": (
+                {
+                    "id": int(r[6]),
+                    "status": r[7],
+                    "adapter_dir": r[8],
+                    "completed_at": float(r[9]) if r[9] is not None else None,
+                }
+                if r[6] is not None
+                else None
+            ),
+        }
+        for r in rows
+    ]
+
+
+def rename_calibration(
+    conn: sqlite3.Connection, calibration_id: int, display_name: str | None
+) -> bool:
+    """Update the human-readable label on a calibration row.
+
+    Passing ``None`` clears the label (the UI falls back to
+    "Calibration #<id>" in that case). Returns False if no row matches
+    the id. Empty/whitespace strings are normalized to NULL upstream by
+    the route handler.
+    """
+    cur = conn.execute(
+        "UPDATE calibrations SET display_name = ? WHERE id = ?",
+        (display_name, calibration_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def list_corrective_training_pairs(
+    conn: sqlite3.Connection, adapter_slug: str
+) -> list[dict]:
+    """Return live patient utterances suitable for adapter retraining.
+
+    A row qualifies when:
+      * it is a patient utterance (``is_patient = 1``)
+      * the active adapter at the time matched ``adapter_slug``
+      * audio was saved to disk (``audio_path`` is non-null and exists
+        — the caller is responsible for the existence check)
+      * a translation row exists with listener feedback. The
+        ``translations.feedback`` column is a JSON blob with
+        ``{"confirmed": bool, "corrected_text": str | null, ...}``;
+        we parse it here so callers don't have to know that.
+
+    The intended_text is the corrected text when the listener typed one,
+    otherwise the ASR primary (which the listener confirmed by clicking
+    "Looks right"). Either way the (audio, intended_text) pair is a
+    valid ground-truth example for fine-tuning.
+    """
+    cur = conn.execute(
+        "SELECT u.id, u.audio_path, u.end_ms - u.start_ms AS duration_ms,"
+        "       t.feedback, t.primary_text"
+        "  FROM utterances u"
+        "  JOIN translations t ON t.utterance_id = u.id"
+        " WHERE u.is_patient = 1"
+        "   AND u.adapter_slug = ?"
+        "   AND u.audio_path IS NOT NULL"
+        "   AND t.feedback IS NOT NULL"
+        " ORDER BY u.id",
+        (adapter_slug,),
+    )
+    out: list[dict] = []
+    for row in cur.fetchall():
+        utt_id = int(row[0])
+        audio_path = row[1]
+        duration_ms = int(row[2] or 0)
+        feedback_raw = row[3]
+        primary_text = row[4]
+        try:
+            fb = json.loads(feedback_raw) if feedback_raw else {}
+        except json.JSONDecodeError:
+            continue
+        confirmed = bool(fb.get("confirmed"))
+        corrected_text = fb.get("corrected_text") or None
+        if isinstance(corrected_text, str):
+            corrected_text = corrected_text.strip() or None
+        # Corrections override the ASR; confirmations keep it.
+        text = (
+            corrected_text
+            if (not confirmed and corrected_text)
+            else (primary_text or "").strip()
+        )
+        if not text:
+            continue
+        out.append(
+            {
+                "id": utt_id,
+                "audio_path": audio_path,
+                "intended_text": text,
+                "duration_ms": duration_ms,
+                "source": "confirmed" if confirmed else "corrected",
+            }
+        )
+    return out
+
+
+def delete_calibration(conn: sqlite3.Connection, calibration_id: int) -> bool:
+    """Remove a calibration row + everything that hangs off it.
+
+    FK CASCADE on calibration_utterances, training_jobs, and
+    patient_profiles takes care of the dependents. online_observations
+    rows keep their data but lose the calibration link (ON DELETE SET
+    NULL). Returns True if a row was removed, False if not found.
+    """
+    cur = conn.execute(
+        "DELETE FROM calibrations WHERE id = ?",
+        (calibration_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def add_calibration_utterance(
@@ -511,6 +751,121 @@ def write_patient_profile(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+# ------------------------------------------------------------- training jobs
+
+
+def create_training_job(
+    conn: sqlite3.Connection,
+    calibration_id: int,
+    adapter_dir: str,
+    speaker_label: str | None,
+    log_path: str,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO training_jobs"
+        " (calibration_id, adapter_dir, speaker_label, log_path, status)"
+        " VALUES (?, ?, ?, ?, 'queued')",
+        (calibration_id, adapter_dir, speaker_label, log_path),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_training_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    status: str | None = None,
+    pid: int | None = None,
+    eval_summary_json: str | None = None,
+    error_message: str | None = None,
+    completed_at: float | None = None,
+) -> None:
+    """Patch the fields the caller supplied; leave others untouched."""
+    fields: list[str] = []
+    params: list = []
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if pid is not None:
+        fields.append("pid = ?")
+        params.append(pid)
+    if eval_summary_json is not None:
+        fields.append("eval_summary_json = ?")
+        params.append(eval_summary_json)
+    if error_message is not None:
+        fields.append("error_message = ?")
+        params.append(error_message)
+    if completed_at is not None:
+        fields.append("completed_at = ?")
+        params.append(completed_at)
+    if not fields:
+        return
+    params.append(job_id)
+    conn.execute(
+        f"UPDATE training_jobs SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+
+
+def get_training_job(
+    conn: sqlite3.Connection, job_id: int
+) -> dict | None:
+    cur = conn.execute(
+        "SELECT id, calibration_id, adapter_dir, speaker_label, status,"
+        " pid, log_path, eval_summary_json, error_message,"
+        " started_at, completed_at"
+        " FROM training_jobs WHERE id = ?",
+        (job_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row[0]),
+        "calibration_id": int(row[1]),
+        "adapter_dir": row[2],
+        "speaker_label": row[3],
+        "status": row[4],
+        "pid": int(row[5]) if row[5] is not None else None,
+        "log_path": row[6],
+        "eval_summary_json": row[7],
+        "error_message": row[8],
+        "started_at": float(row[9]),
+        "completed_at": float(row[10]) if row[10] is not None else None,
+    }
+
+
+def list_training_jobs_for_calibration(
+    conn: sqlite3.Connection, calibration_id: int
+) -> list[dict]:
+    cur = conn.execute(
+        "SELECT id, calibration_id, adapter_dir, speaker_label, status,"
+        " pid, log_path, eval_summary_json, error_message,"
+        " started_at, completed_at"
+        " FROM training_jobs WHERE calibration_id = ?"
+        " ORDER BY started_at DESC",
+        (calibration_id,),
+    )
+    out: list[dict] = []
+    for row in cur.fetchall():
+        out.append({
+            "id": int(row[0]),
+            "calibration_id": int(row[1]),
+            "adapter_dir": row[2],
+            "speaker_label": row[3],
+            "status": row[4],
+            "pid": int(row[5]) if row[5] is not None else None,
+            "log_path": row[6],
+            "eval_summary_json": row[7],
+            "error_message": row[8],
+            "started_at": float(row[9]),
+            "completed_at": float(row[10]) if row[10] is not None else None,
+        })
+    return out
 
 
 def latest_patient_profile(

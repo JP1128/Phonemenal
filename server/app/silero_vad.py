@@ -1,5 +1,10 @@
 """Silero VAD wrapper exposing the same is_speech(frame) contract as webrtcvad.
 
+NOTE: This file backs slide 2 of ``client/app/how-it-works/page.tsx``. If
+you change the VAD backend, threshold, or segmentation parameters here,
+update the matching slide. See CLAUDE.md ("Documentation invariant").
+
+
 Loads the bundled silero-vad PyTorch model once and runs it on 30 ms PCM
 frames at 16 kHz. The model itself prefers 32 ms windows internally, so we
 zero-pad / truncate as needed and let it score each window. A minimum

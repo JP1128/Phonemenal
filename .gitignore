@@ -9,6 +9,10 @@
 .env
 .env.local
 
+# Local-only notes
+CLAUDE.md
+JOURNAL.md
+
 # Python
 __pycache__/
 *.py[cod]
@@ -30,5 +34,6 @@ build/
 server/data/audio/
 server/data/torgo/
 server/data/models/
+server/data/adapters/
 server/data/*.db
 server/data/*.db-journal

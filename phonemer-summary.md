@@ -25,7 +25,7 @@ worse than no transcription at all.
 
 ## What Phonemer Actually Does (Current Architecture)
 
-Phonemer is a Whisper-based ASR with two value-adds rigorously
+Phonemer is a Whisper-based ASR with three value-adds rigorously
 validated against TORGO:
 
 1. **A phoneme-alignment safety gate.** Every Whisper transcription is
@@ -36,12 +36,17 @@ validated against TORGO:
    output. Validated TP rate ~58%, FP rate **0%** on dysarthric and
    control speech.
 
-2. **Per-patient severity calibration.** A patient reads known
-   sentences once during onboarding; the system builds a phoneme
-   confusion matrix and tracks it over time. PER on a fixed
-   intelligibility set ranks severity reliably (control TIMIT PER ~7%,
-   mild dysarthria ~35%, severe ~70%). Useful as an SLP / therapy
-   progress tool.
+2. **Per-patient Whisper LoRA adapters.** Trained on a patient's own
+   speech (recordings of them reading known sentences) via PEFT/LoRA on
+   top of `whisper-small.en`. On TORGO, a per-speaker adapter cuts
+   relative WER by 32–47% vs. naive Whisper on the held-out eval split
+   (see `JOURNAL.md` entries 9 + 13 for the empirical breakdown).
+
+3. **Per-patient severity calibration.** The same calibration recordings
+   produce a phoneme confusion matrix that tracks severity over time.
+   PER on a fixed intelligibility set ranks severity reliably (control
+   TIMIT PER ~7%, mild dysarthria ~35%, severe ~70%). Useful as an SLP /
+   therapy progress tool.
 
 The listener UI surfaces every transcription, but flagged outputs
 render with a red ring + "uncertain — phoneme alignment doesn't
@@ -49,6 +54,64 @@ support this." Text stays visible because hiding it would defeat the
 medical-safety story (the listener needs to see the candidate to
 judge it); the visual treatment makes clear the system isn't standing
 behind the words.
+
+---
+
+## Clinical Workflow
+
+The system is built for a single-patient-at-a-time clinical setting
+(rehab unit, post-surgical recovery, ALS clinic). The intended
+deployment flow:
+
+1. **Enroll.** The patient is identified in the system via the home
+   page's profile dropdown — *"+ New profile"* routes to `/calibrate`
+   where the doctor enters a display name ("Bed 4 — Jane Doe").
+
+2. **Record.** Over one or more 10–20 minute sessions, the patient
+   reads short prompts pulled from `data/calibration_sentences.json`
+   (145 prompts across 7 sets covering basic needs, medical comms,
+   prosody, phoneme balance, conversational function-word coverage,
+   numbers/dates). Each recording is stored as a row in
+   `calibration_utterances` keyed to the patient's calibration id.
+   The doctor can **End session** between days; reopening `/calibrate`
+   shows a resume list with per-patient progress and a **Resume**
+   button that picks up at the first un-recorded prompt.
+
+3. **Train.** Once the patient has recorded ≥30 utterances, the
+   **Train adapter** button on the calibrate page becomes enabled.
+   Clicking it spawns `scripts/train_patient_adapter.py` as a
+   subprocess that produces a per-patient PEFT/LoRA on
+   `whisper-small.en`. Training takes ~5–30 minutes on a workstation
+   GPU; live progress + log tail render in a banner via polling.
+
+4. **Use.** Once training completes, the adapter is written to
+   `data/adapters/<slug>/` and the home page's profile dropdown picks
+   it up automatically (refreshed every 30 s + on tab focus). The
+   doctor selects that patient — the live mic now routes through the
+   patient's LoRA via `?adapter_speaker=<slug>` on the WS, and
+   transcription is tailored to the patient's speech.
+
+5. **Re-train as speech changes.** During rehab the patient's speech
+   improves; re-running the training overwrites the existing adapter
+   so live transcription tracks recovery (versioning is a planned
+   follow-up).
+
+The same UI also lets the doctor switch the active profile between
+multiple calibrated patients, or use the "Demo TORGO" profile to
+exercise the system against pre-recorded TORGO speakers (F01/F03/F04/M01–M05).
+
+### What's in scope vs. not
+
+- Adapter training is initiated from the UI but runs as a subprocess
+  on the local machine — there's no remote orchestration. A GPU on the
+  deploy box is assumed; CPU-only will work but takes hours.
+- Adapters are not auto-validated. A doctor's first training run is
+  shipped regardless of held-out WER. Adding a "min improvement vs.
+  baseline" gate before saving is a planned follow-up.
+- Calibration is for the *transcription model* (Whisper LoRA). It does
+  not change the gate's thresholds or the prosody-baseline-driven
+  emergency / emotion detectors (those have their own per-patient
+  baseline computed in `build_profile`).
 
 ---
 
@@ -91,7 +154,9 @@ Silero VAD + utterance segmentation
 ECAPA-TDNN speaker ID  ── non-patient → faster-whisper → context window
    ↓ (patient)
    ├─ wav2vec2 phoneme distribution  ──┐
-   └─ faster-whisper transcription  ───┤
+   └─ patient-LoRA Whisper transcribe ─┤   (LoRA picked by ?adapter_speaker
+                                       │    on the WS — derived from the home
+                                       │    page's active profile)
                                        ├──→ forced-align (text vs distribution)
                                        │       ↓
                                        │   alignment score + phoneme density
@@ -103,6 +168,16 @@ ECAPA-TDNN speaker ID  ── non-patient → faster-whisper → context window
                                   flagged → red ring + "uncertain" hint
                                   ok      → green/yellow per-word shading
 ```
+
+**Adapter selection at runtime.** The `AdaptedTranscriber` loads
+`whisper-small.en` once and uses PEFT's `load_adapter` + `set_adapter`
+to swap per-patient LoRA deltas on a shared base. Memory cost per
+extra calibrated patient is ~30 MB (the LoRA), not ~244 MB (a full
+Whisper). When the live mic opens a WS with `?adapter_speaker=<id>`,
+the server resolves to `data/adapters/<id>/` (exact match for patient
+slugs like `Jane_Doe`; TORGO-style prefix match for `F03` →
+`F03_balanced` etc., choosing the newest base-compatible variant) and
+activates that LoRA for the session.
 
 **Concurrent paths that aren't on the live translation flow:**
 

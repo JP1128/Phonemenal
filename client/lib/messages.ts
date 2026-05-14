@@ -128,6 +128,23 @@ export type UtteranceRejectedMessage = {
   reason: "non_speech" | string;
 };
 
+/**
+ * Diagnostic log line emitted by the server. The frontend collects these
+ * per-stream so the user can copy a compact, deterministic timeline of
+ * what happened during one clip stream (VAD events, decode timings,
+ * gate decisions, adapter swaps, …) without slogging through the
+ * server's stdout. ``ts_ms`` is the milliseconds since the WS opened,
+ * so logs line up cleanly even when CPU times stamp at different rates.
+ */
+export type DiagMessage = {
+  type: "diag";
+  session_id: number;
+  ts_ms: number;
+  level: "info" | "warn" | "error";
+  msg: string;
+  data?: Record<string, unknown>;
+};
+
 export type WsMessage =
   | UtteranceMessage
   | PhonemeWindowMessage
@@ -137,7 +154,8 @@ export type WsMessage =
   | TranslationErrorMessage
   | EmergencyMessage
   | UtteranceRejectedMessage
-  | ContextMessage;
+  | ContextMessage
+  | DiagMessage;
 
 export type WsMessageType = WsMessage["type"];
 

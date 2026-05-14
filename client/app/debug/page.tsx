@@ -746,6 +746,8 @@ function summarize(msg: WsMessage): string {
       return `topics=${msg.context.topics.length} questions=${msg.context.pending_questions.length}`;
     case "translation_error":
       return `${msg.error}: ${msg.message}`;
+    case "diag":
+      return `diag ${msg.level}: ${msg.msg}`;
   }
 }
 

@@ -31,6 +31,28 @@ _STRIP_CHARS = {
 }
 _TOKEN_SEP = re.compile(r"\s+")
 
+# Espeak-ng emits some R-colored vowels and triphthongs as a single
+# concatenated symbol (e.g. "ɑɹ" for "are", "ɔɚ" for "for") that the
+# wav2vec2-lv-60 vocab doesn't carry — the model has the components
+# separately ("ɑ" + "ɹ"), but not the joined form. Without splitting
+# these, words like "are" / "your" / "for" silently lose all phonemes
+# during the vocab filter and contribute zero signal to forced
+# alignment. Mapping is to component phonemes that ARE in the vocab
+# (or aliased there via _load_alias_map's existing ɚ→ə rule).
+_COMPOUND_SPLIT: dict[str, tuple[str, ...]] = {
+    "ɑɹ": ("ɑ", "ɹ"),       # are, far, car
+    "ɔɹ": ("ɔ", "ɹ"),       # or, four, more
+    "aɪɹ": ("aɪ", "ɹ"),     # fire, hire (some dialects)
+    "aʊɹ": ("aʊ", "ɹ"),     # hour, our (some dialects)
+    "aʊə": ("aʊ", "ə"),     # tower, power
+    "oʊə": ("oʊ", "ə"),     # boa, koala
+    "ɪɚ": ("ɪ", "ə"),       # near, dear (ɚ aliases to ə downstream)
+    "ɛɚ": ("ɛ", "ə"),       # there, hair
+    "ɔɚ": ("ɔ", "ə"),       # for, north
+    "ʊɚ": ("ʊ", "ə"),       # tour, sure
+    "ɑɚ": ("ɑ", "ə"),       # arm, far (rhotic dialects via ɚ)
+}
+
 
 @lru_cache(maxsize=1)
 def _load_alias_map() -> dict[str, str]:
@@ -58,6 +80,13 @@ def normalize_phonemes(raw: str | Iterable[str]) -> list[str]:
         for ch in _STRIP_CHARS:
             tok = tok.replace(ch, "")
         if not tok:
+            continue
+        # Split known compound symbols (R-colored vowels etc.) into
+        # their component phonemes before the alias step so each piece
+        # gets the chance to map cleanly into the vocab.
+        if tok in _COMPOUND_SPLIT:
+            for part in _COMPOUND_SPLIT[tok]:
+                out.append(aliases.get(part, part))
             continue
         out.append(aliases.get(tok, tok))
     return out
