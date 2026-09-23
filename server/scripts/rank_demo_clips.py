@@ -82,9 +82,15 @@ async def stream_clip(audio_bytes: bytes, adapter_speaker: str) -> dict[str, Any
     every other speaker's audio). WAV PCM starts after the 44-byte
     header.
     """
+    # bypass_vad=1 because TORGO demo clips are curated audio with known
+    # speech content — VAD's segmentation can spuriously reject heavily
+    # dysarthric speech (M01 in particular) where the energy envelope
+    # doesn't match VAD's expectation of "normal" voicing. The live mic
+    # path still uses VAD; we only bypass it for these scripted demos.
     url = (
         f"{SERVER_WS}/ws/audio?force_patient=1"
         f"&adapter_speaker={adapter_speaker}"
+        f"&bypass_vad=1"
     )
     translations: list[dict] = []
     error: str | None = None

@@ -1,15 +1,168 @@
 @import "tailwindcss";
 
+/* ---------------------------------------------------------------------------
+   Theme tokens
+   ---------------------------------------------------------------------------
+   Light mode "inverts" Tailwind's neutral scale + white/black at the
+   token level. Existing classes like `bg-neutral-900`, `text-neutral-300`,
+   `border-white/10` keep their *semantic role* (surface / body / hairline
+   border) but their literal color flips with the active theme. This lets us
+   ship a light theme without touching the ~400 hardcoded color classes
+   scattered across the components.
+   --------------------------------------------------------------------------- */
+
+:root,
+[data-theme="dark"] {
+  --background: #0a0a0a;
+  --foreground: #fafafa;
+  --muted: #6b7280;
+
+  /* Tailwind neutral palette — dark theme = stock values */
+  --c-neutral-50: #fafafa;
+  --c-neutral-100: #f5f5f5;
+  --c-neutral-200: #e5e5e5;
+  --c-neutral-300: #d4d4d4;
+  --c-neutral-400: #a3a3a3;
+  --c-neutral-500: #737373;
+  --c-neutral-600: #525252;
+  --c-neutral-700: #404040;
+  --c-neutral-800: #262626;
+  --c-neutral-900: #171717;
+  --c-neutral-950: #0a0a0a;
+
+  --c-white: #ffffff;
+  --c-black: #000000;
+
+  /* Slide-mode surfaces (used by /how-it-works).
+     SVG illustrations and card backgrounds inside the presentation slides
+     reference these so the dark "screen", "device", or "card" rectangles
+     auto-adapt to light mode without per-slide branching. */
+  --slide-surface: #171717;         /* SVG rect fills, opaque card panels */
+  --slide-surface-rgb: 23, 23, 23;  /* same color in rgb form for rgba() */
+  --slide-screen: #0a0a0a;          /* deeper "behind-the-glass" fills */
+  --slide-stroke: #525252;          /* hairline strokes in illustrations */
+  --slide-marker: #ffffff;          /* vertical playhead / accent markers */
+  --slide-marker-glow: 255, 255, 255; /* glow color for the marker shadow */
+
+  /* Glassmorphism tokens. Cards use a translucent base + backdrop-blur so
+     the page wash refracts through. The "highlight" line is the inset
+     top-edge bright line that sells the glass look. Shadow grounds the
+     card so it looks lifted, not painted. */
+  --glass-bg-rgb: 28, 28, 30;          /* base fill behind the blur */
+  --glass-highlight-rgb: 255, 255, 255;/* inset top edge highlight */
+  --glass-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+[data-theme="light"] {
+  --background: #fafafa;
+  --foreground: #0a0a0a;
+  --muted: #6b7280;
+
+  /* Inverted scale: dark surfaces become light surfaces, light text
+     becomes dark text. The midtone (500) stays roughly neutral so muted
+     copy keeps similar contrast in both themes. */
+  --c-neutral-50: #18181b;
+  --c-neutral-100: #1f2937;
+  --c-neutral-200: #27272a;
+  --c-neutral-300: #3f3f46;
+  --c-neutral-400: #52525b;
+  --c-neutral-500: #6b7280;
+  --c-neutral-600: #a1a1aa;
+  --c-neutral-700: #d4d4d8;
+  --c-neutral-800: #e4e4e7;
+  --c-neutral-900: #f1f5f9;
+  --c-neutral-950: #fafafa;
+
+  /* `text-white`, `bg-white`, and `bg-white/X` overlays read as
+     "high-contrast surface" in dark mode. In light mode the contrast
+     direction flips, so white tokens become dark. */
+  --c-white: #0a0a0a;
+
+  /* `bg-black/X` is used as a subtle *darker* overlay (headers,
+     drawers, input fields). It must stay literal black in both themes
+     so a 20–40% alpha layer reads as a soft dark tint on the light
+     canvas instead of vanishing into white-on-white. No opaque
+     `text-black`, `bg-black`, or `border-black` usage exists, so we
+     don't need a separate token for those. */
+  --c-black: #000000;
+
+  /* Accent-text inversion.
+     Chip-style elements use pale text on dim color tints
+     (`bg-rose-500/15 text-rose-200`). The faint backgrounds stay legible
+     on white, but the 100/200/300 text shades collapse into the same
+     pale region as the chip background, making the label invisible.
+     Override the pale text shades to dark counterparts so e.g.
+     "SEVERE" rose-200 text becomes deep rose on a pale-rose pill. */
+  --color-rose-100: #881337;
+  --color-rose-200: #9f1239;
+  --color-rose-300: #be123c;
+  --color-red-200: #991b1b;
+  --color-red-300: #b91c1c;
+  --color-pink-300: #be185d;
+  --color-amber-100: #78350f;
+  --color-amber-200: #92400e;
+  --color-amber-300: #b45309;
+  --color-emerald-100: #064e3b;
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-teal-100: #134e4a;
+  --color-teal-200: #115e59;
+  --color-teal-300: #0f766e;
+  --color-sky-200: #075985;
+  --color-sky-300: #0369a1;
+  --color-cyan-200: #155e75;
+  --color-cyan-300: #0e7490;
+  --color-blue-200: #1e3a8a;
+  --color-blue-300: #1d4ed8;
+  --color-violet-200: #5b21b6;
+  --color-violet-300: #6d28d9;
+  --color-purple-300: #7e22ce;
+
+  /* Slide-mode surfaces inverted: the "dark device" boxes in the
+     presentation visualizations now read as light panels on the white
+     canvas, while playhead markers flip from white-on-dark to
+     dark-on-light. The deep "screen" colour stays nearly-dark so a
+     literal pupil/dot still reads as a pupil/dot, not a hole. */
+  --slide-surface: #e4e4e7;          /* zinc-200 — light surface panel */
+  --slide-surface-rgb: 228, 228, 231;
+  --slide-screen: #18181b;           /* zinc-900 — stays dark by design */
+  --slide-stroke: #a1a1aa;           /* zinc-400 — mid-tone strokes */
+  --slide-marker: #0a0a0a;
+  --slide-marker-glow: 10, 10, 10;
+
+  /* Glassmorphism — light theme. Frosted-white base, dark inset edge
+     (instead of white), and a softer shadow that reads on paper rather
+     than punching out of black. */
+  --glass-bg-rgb: 255, 255, 255;
+  --glass-highlight-rgb: 255, 255, 255;
+  --glass-shadow: 0 10px 30px rgba(15, 23, 42, 0.08), 0 4px 10px rgba(15, 23, 42, 0.05);
+}
+
 @theme {
-  --color-background: #0a0a0a;
-  --color-foreground: #fafafa;
-  --color-muted: #6b7280;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+
+  --color-neutral-50: var(--c-neutral-50);
+  --color-neutral-100: var(--c-neutral-100);
+  --color-neutral-200: var(--c-neutral-200);
+  --color-neutral-300: var(--c-neutral-300);
+  --color-neutral-400: var(--c-neutral-400);
+  --color-neutral-500: var(--c-neutral-500);
+  --color-neutral-600: var(--c-neutral-600);
+  --color-neutral-700: var(--c-neutral-700);
+  --color-neutral-800: var(--c-neutral-800);
+  --color-neutral-900: var(--c-neutral-900);
+  --color-neutral-950: var(--c-neutral-950);
+
+  --color-white: var(--c-white);
+  --color-black: var(--c-black);
 }
 
 html,
 body {
-  background: var(--color-background);
-  color: var(--color-foreground);
+  background: var(--background);
+  color: var(--foreground);
 }
 
 /* Used by the /how-it-works presentation slides for sub-step transitions.
@@ -62,18 +215,6 @@ body {
   50% {
     opacity: 1;
     transform: scale(1.08);
-  }
-}
-
-/* /how-it-works architecture slide — comet streak along connector paths.
-   Used by FlowLine: each layer has dasharray "W (100-W)" with
-   pathLength=100, so exactly one dash of width W is on the path. As
-   stroke-dashoffset goes 0 → -100, that single dash sweeps from start
-   to end. Stacked layers with staggered animation-delays form a
-   fading tail behind the head. */
-@keyframes cometDash {
-  to {
-    stroke-dashoffset: -100;
   }
 }
 

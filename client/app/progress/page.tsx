@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AccessibilityPanel } from "../../components/accessibility-panel";
+import { ThemeToggle } from "../../components/theme-toggle";
 import { useAccessibility } from "../../lib/accessibility";
 
 const SERVER_HTTP =
@@ -124,7 +125,7 @@ export default function ProgressPage() {
     >
       <header className="flex items-center gap-3 max-w-4xl mx-auto mb-6">
         <h1 className="text-lg font-semibold tracking-wide">
-          Phonemer · Progress
+          Phonemenal · Progress
         </h1>
         <button
           onClick={() => refresh(true)}
@@ -179,7 +180,7 @@ export default function ProgressPage() {
           </h2>
           <p className="text-xs opacity-70 leading-relaxed">
             Names, medications, and preferred terms get a probability boost in
-            the LLM's candidate generation. Add anything Phonemer should
+            the LLM's candidate generation. Add anything Phonemenal should
             recognize even when the phoneme evidence is thin.
           </p>
 
@@ -245,6 +246,7 @@ export default function ProgressPage() {
         </section>
       </div>
 
+      <ThemeToggle />
       <AccessibilityPanel
         settings={a11y.settings}
         onChange={a11y.setSettings}

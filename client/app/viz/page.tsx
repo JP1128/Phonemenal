@@ -29,7 +29,7 @@ export default function VizPage() {
     >
       <header className="flex flex-wrap items-center gap-3 mb-6">
         <h1 className="text-xl font-semibold tracking-wide">
-          Phonemer · Pipeline (canned demo)
+          Phonemenal · Pipeline (canned demo)
         </h1>
         <span className="text-xs opacity-50 font-mono">
           live audio → phonemes → distortion model → LLM → text

@@ -4,7 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { ControlBadge, SeverityBadge } from "./severity-badge";
 import type { CalibratedSpeaker, Profile } from "../lib/profile";
 import { profileLabel } from "../lib/profile";
-import { isControlSpeaker, severityFor } from "../lib/torgo-speakers";
+import {
+  displayNameFor,
+  isControlSpeaker,
+  severityFor,
+} from "../lib/torgo-speakers";
 
 export type ProfileSelectorProps = {
   profile: Profile;
@@ -84,6 +88,12 @@ export function ProfileSelector({
               calibratedSpeakers.map((s) => {
                 const active =
                   profile.kind === "calibrated" && profile.speakerId === s.id;
+                const demoName =
+                  s.kind === "torgo" ? displayNameFor(s.id) : null;
+                const primaryLabel = demoName ?? s.label;
+                const showIdHint =
+                  demoName !== null ||
+                  (s.kind === "patient" && s.label !== s.id);
                 return (
                   <ProfileMenuItem
                     key={s.id}
@@ -97,12 +107,14 @@ export function ProfileSelector({
                     <span className="inline-flex items-center gap-1.5">
                       <span
                         className={
-                          s.kind === "torgo" ? "font-mono" : "font-medium"
+                          s.kind === "torgo" && !demoName
+                            ? "font-mono"
+                            : "font-medium"
                         }
                       >
-                        {s.label}
+                        {primaryLabel}
                       </span>
-                      {s.kind === "patient" && s.label !== s.id && (
+                      {showIdHint && (
                         <span className="text-[9px] opacity-40 font-mono">
                           {s.id}
                         </span>

@@ -356,7 +356,7 @@ export default function DebugPage() {
     >
       <header className="px-4 py-3 border-b border-neutral-800 flex items-center gap-4 flex-wrap">
         <span className="text-base font-semibold tracking-wide">
-          Phonemer · Debug
+          Phonemenal · Debug
         </span>
         <a
           href="/calibrate"

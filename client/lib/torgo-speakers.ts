@@ -35,6 +35,24 @@ export const SPEAKER_SEVERITY: Record<string, Severity> = {
 };
 
 /**
+ * Demo-only display names for TORGO speakers. TORGO ids are anonymised
+ * (M01 / F03 / …), which is correct for the dataset but reads as clinical
+ * jargon in a live demo where stakeholders expect a "patient name." The
+ * Profile selector swaps these in for the chip + menu label; the canonical
+ * id is still kept as a small annotation so the operator can correlate
+ * back to the corpus.
+ */
+export const SPEAKER_DISPLAY_NAME: Record<string, string> = {
+  M01: "Michael",
+  F03: "Fiona",
+  FC02: "Claire",
+};
+
+export function displayNameFor(speakerId: string): string | null {
+  return SPEAKER_DISPLAY_NAME[speakerId.toUpperCase()] ?? null;
+}
+
+/**
  * TORGO control speakers are non-dysarthric — they're labelled with a
  * "C" infix (FC01–FC03, MC01–MC04). The corpus has no other prefix
  * conventions, so a regex on the id is reliable.

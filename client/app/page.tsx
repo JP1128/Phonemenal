@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { AccessibilityPanel } from "../components/accessibility-panel";
+import { ThemeToggle } from "../components/theme-toggle";
 import { Button } from "../components/button";
 import { KeyboardHelp } from "../components/keyboard-help";
 import {
@@ -950,6 +951,7 @@ export default function HomePage() {
             onReconnect={session.reconnect}
           />
           <KeyboardHelp />
+          <ThemeToggle />
           <AccessibilityPanel
             settings={a11y.settings}
             onChange={a11y.setSettings}
@@ -1318,7 +1320,7 @@ function EmptyState({
           className="font-medium tracking-tight"
           style={{ fontSize: "calc(var(--phonemer-base-size) * 2.4)" }}
         >
-          Phonemer is listening
+          Phonemenal is listening
         </h1>
         <p className="opacity-50 text-base">
           {isLive || demoActive
@@ -1335,12 +1337,12 @@ function EmptyState({
       )}
 
       {showCalibrateHint && (
-        <div className="mt-12 inline-flex flex-col items-center gap-2 px-5 py-4 rounded-lg border border-white/10 bg-white/[0.02]">
+        <div className="mt-12 inline-flex flex-col items-center gap-2 px-5 py-4 rounded-lg border border-white/10 bg-neutral-900/30 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
           <div className="text-xs uppercase tracking-[0.25em] font-mono opacity-50">
             new patient?
           </div>
           <div className="text-sm opacity-80 max-w-sm">
-            Calibrate first — recording 145 short prompts lets Phonemer
+            Calibrate first — recording 145 short prompts lets Phonemenal
             adapt to a patient's speech and dramatically improves
             transcription accuracy.
           </div>
@@ -2305,7 +2307,7 @@ function buildDiagnosticReport(
   const wordOps = wordDiffOps(refWords, hypWords);
 
   const lines: string[] = [];
-  lines.push("# Phonemer transcription diagnostic");
+  lines.push("# Phonemenal transcription diagnostic");
   lines.push("");
   lines.push(`Speaker: ${row.speaker}`);
   lines.push(`Intended: "${intended}"`);

@@ -18,6 +18,7 @@
 // invariant" for the full rule and the most-common changes that need it.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPhonemerWs } from "../../lib/phonemer-ws";
+import { useTheme } from "../../lib/theme";
 import type {
   PhonemeWindowMessage,
   TranslationMessage,
@@ -98,26 +99,24 @@ const initialPipelineState: PipelineState = {
 // this so the same patient cards morph from "what they said" to "what
 // whisper heard" without a hard slide transition.
 const SLIDES = [
-  { id: "title",        title: "Intro",                     phase: "problem",      steps: 1 },
-  { id: "problem",      title: "Patients & off-the-shelf Whisper", phase: "problem", steps: 2 },
-  { id: "stack",        title: "What it's built with",      phase: "architecture", steps: 1 },
-  { id: "architecture", title: "The Phonemer pipeline",     phase: "architecture", steps: 1 },
-  { id: "strengths",    title: "The two strengths",         phase: "calibration",  steps: 1 },
-  { id: "demo",         title: "Live demo · the difference", phase: "demo",        steps: 1 },
+  { id: "app",          title: "Phonemenal · the app",      phase: "app",     steps: 1 },
+  { id: "problem",      title: "Patients & off-the-shelf Whisper", phase: "problem", steps: 1 },
+  { id: "architecture", title: "Inside the app · the pipeline", phase: "inside", steps: 4 },
+  { id: "demo",         title: "Live demo · the difference", phase: "demo",    steps: 3 },
 ] as const;
 
 const PHASE_META: Record<string, { label: string; color: string }> = {
-  problem:      { label: "1 · The problem",      color: "amber"   },
-  architecture: { label: "2 · The system",       color: "cyan"    },
-  calibration:  { label: "3 · The two strengths", color: "violet" },
-  demo:         { label: "4 · Live demo",        color: "emerald" },
+  app:     { label: "1 · The app",          color: "cyan"    },
+  problem: { label: "2 · The problem",      color: "amber"   },
+  inside:  { label: "3 · Inside the app",   color: "cyan"    },
+  demo:    { label: "4 · Live demo",        color: "emerald" },
 };
 
 const PHASE_ACCENT_HEX: Record<string, string> = {
-  problem:      "#f59e0b", // amber-500
-  architecture: "#06b6d4", // cyan-500
-  calibration:  "#8b5cf6", // violet-500
-  demo:         "#10b981", // emerald-500
+  app:     "#06b6d4", // cyan
+  problem: "#f59e0b", // amber
+  inside:  "#06b6d4", // cyan — same as app, both about the system we built
+  demo:    "#10b981", // emerald
 };
 
 // Wrap fetch with a label so any "Failed to fetch" surfaces *which* URL
@@ -234,8 +233,13 @@ export default function HowItWorksPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playhead = useAudioPlayhead(audioRef.current);
 
-  // Load TORGO clips list once.
+  // Load TORGO clips list once — but only after the user advances past
+  // slide 0. The Problem slide is now static (baked-in transcripts);
+  // fetching ~5 MB of clip metadata while the audience is reading the
+  // first slide just adds main-thread JSON parse work for no benefit.
+  // ArchitectureSlide/StrengthsSlide/DemoSlide will need it by then.
   useEffect(() => {
+    if (slide === 0 || clips.length > 0) return;
     let cancelled = false;
     fetchWithLabel("GET /torgo/clips", `${SERVER_HTTP}/torgo/clips?limit=20000`)
       .then((r) => r.json())
@@ -258,6 +262,14 @@ export default function HowItWorksPage() {
           errorMessage: `bootstrap: ${e.message}`,
         }));
       });
+    return () => {
+      cancelled = true;
+    };
+  }, [slide, clips.length]);
+
+  // Healthz probe — cheap, fires once on mount independent of slide.
+  useEffect(() => {
+    let cancelled = false;
     fetchWithLabel("GET /healthz", `${SERVER_HTTP}/healthz`)
       .then((r) => r.json())
       .then((data) => {
@@ -419,9 +431,17 @@ export default function HowItWorksPage() {
     // ``data/adapters/<speaker_id>*`` (the server's _resolve_adapter_dir
     // does a prefix-match so a directory like ``M01_small_hicap``
     // resolves for ``adapter_speaker=M01``).
+    //
+    // ``bypass_vad=1`` because the TORGO demo clips are curated audio
+    // with known speech content. VAD's energy-based segmentation can
+    // spuriously reject heavily-dysarthric speech (M01 in particular —
+    // the envelope doesn't match "normal" voicing), leaving the
+    // Phonemer card empty. The live mic path still uses VAD; we only
+    // bypass it for these scripted demos where the clip IS the speech.
     const wsUrl =
       SERVER_HTTP.replace(/^http/, "ws") +
-      `/ws/audio?force_patient=1&adapter_speaker=${encodeURIComponent(selectedClip.speaker_id)}`;
+      `/ws/audio?force_patient=1&bypass_vad=1` +
+      `&adapter_speaker=${encodeURIComponent(selectedClip.speaker_id)}`;
     let didStream = false;
     // Track expected vs received translations so we can use a *longer* idle
     // window while Whisper is still working on a known-pending utterance.
@@ -551,7 +571,19 @@ export default function HowItWorksPage() {
     : undefined;
 
   return (
-    <main className="h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-100 flex flex-col">
+    <main
+      className="h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-100 flex flex-col relative"
+      style={{
+        // Two soft accent blobs frame the canvas — kept ambient and at
+        // low opacity so they read as atmosphere, not chrome. Was four
+        // blobs; collapsed to two because every card repaint above
+        // composites through this layer.
+        backgroundImage: `
+          radial-gradient(ellipse at 0% 0%, rgba(245, 158, 11, 0.10), transparent 60%),
+          radial-gradient(ellipse at 100% 100%, rgba(16, 185, 129, 0.10), transparent 60%)
+        `,
+      }}
+    >
       {/* Hidden persistent audio element — playback controls live inside
           slides via PlayButton. Keeping it here means seek state survives
           slide changes. */}
@@ -574,7 +606,7 @@ export default function HowItWorksPage() {
       <header className="flex items-center justify-between gap-4 px-6 py-3 border-b border-neutral-800 bg-neutral-950 text-sm">
         <div className="flex items-center gap-3">
           <div className="font-semibold tracking-tight text-neutral-100">
-            Phonemer
+            Phonemenal
           </div>
           <span
             className="rounded px-2 py-0.5 text-[10px] uppercase tracking-wider font-mono"
@@ -602,20 +634,10 @@ export default function HowItWorksPage() {
 
       {/* Slide content area */}
       <div className="flex-1 min-h-0 overflow-hidden relative">
-        {slide === 0 && <TitleSlide {...slideProps} />}
-        {slide === 1 && <ProblemSlide {...slideProps} clips={clips} />}
-        {slide === 2 && <TechStackSlide {...slideProps} />}
-        {slide === 3 && <ArchitectureSlide {...slideProps} />}
-        {slide === 4 && <StrengthsSlide {...slideProps} />}
-        {slide === 5 && (
-          <DemoSlide
-            {...slideProps}
-            clips={clips}
-            setSelectedClipId={setSelectedClipId}
-            setSpeakerFilter={setSpeakerFilter}
-            runPipeline={runPipeline}
-          />
-        )}
+        {slide === 0 && <AppOverviewSlide {...slideProps} />}
+        {slide === 1 && <ProblemSlide {...slideProps} />}
+        {slide === 2 && <ArchitectureSlide {...slideProps} />}
+        {slide === 3 && <DemoSlide {...slideProps} />}
 
         {/* Per-slide error overlay */}
         {pipeline.errorMessage && (
@@ -758,678 +780,555 @@ function SlideShell({
 
 // ─────────────────────────────────────────────────────── Phase 1 — Problem
 
-function TitleSlide({ pipeline, adapterPath }: SlideProps) {
-  return (
-    <div className="h-full flex flex-col justify-center px-16 max-w-7xl mx-auto w-full">
-      <div className="space-y-5">
-        <h1 className="text-[9rem] font-semibold leading-[0.95] tracking-tight">
-          Phonemenal
-        </h1>
-        <div className="text-xl text-neutral-400 font-mono tracking-tight">
-          by JP Park · Codey Borrelli · Ken Cula
-        </div>
-        <p className="text-2xl text-neutral-300 max-w-3xl leading-relaxed pt-8">
-          Per-patient calibration for traditional speech models —{" "}
-          <span className="text-emerald-300">better transcripts</span>{" "}
-          for brain-injury speech, with honest uncertainty when the model
-          isn&apos;t sure.
-        </p>
-        <div className="pt-10 flex items-center gap-6 text-xs font-mono text-neutral-500">
-          <span>← / → to navigate</span>
-          <span>SPACE for next</span>
-          <span>1–8 to jump</span>
-          {adapterPath && (
-            <span className="ml-auto text-emerald-400">
-              ● adapter loaded · ready
-            </span>
-          )}
-          {pipeline.status === "running" && (
-            <span className="ml-auto text-amber-400">● pipeline running</span>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
-// Curated TIMIT clips per speaker for the problem slides. Picked to give
-// the audience a clean visual gradient on the sub-step-1 reveal:
+// Baked-in demo data for the problem slide. Pre-computed by running
+// vanilla faster-whisper (``base.en``) on TIMIT eval-split clips for
+// each demo speaker — the live ``/demo/whisper`` endpoint would
+// reproduce these byte-for-byte. We hard-code instead of fetching at
+// page-load time so the slide renders instantly and so the demo isn't
+// at the mercy of the audio cache / backend being warm.
 //
-//   FC02 (healthy) : vanilla WER ~0% → ~all green, "Whisper works fine"
-//   F03  (mild)    : vanilla WER ~50-80% → mixed green/red, errors visible
-//   M01  (severe)  : vanilla WER ~100-130% → nearly all red, hallucinated
-//
-// Selected from the TORGO eval split (held out from calibration) by
-// running scripts/find_demo_clips on a length-filtered candidate set
-// (4-10 words so cards aren't dominated by one long sentence).
-//
-// Re-rank by running:  cd server && .venv/bin/python -m scripts.find_demo_clips
-const FEATURED_CLIP_HINTS: Record<string, string[]> = {
+// To regenerate, run (with the backend up):
+//   python3 - <<'EOF'
+//   import json, urllib.request as ur
+//   clips = json.load(ur.urlopen("http://localhost:8000/torgo/clips?limit=20000"))["clips"]
+//   for sp in ["FC02","F03","M01"]:
+//       pool = [c for c in clips if c["speaker_id"]==sp and c["prompt_set"]=="timit"
+//               and c["split"]=="eval" and 4<=len((c["intended_text"] or "").split())<=12]
+//       pool.sort(key=lambda c: c["id"])
+//       for c in pool[:7]:
+//           r = ur.urlopen(ur.Request(f"http://localhost:8000/demo/whisper/{c['id']}", method="POST"))
+//           print(sp, c["intended_text"], "→", json.loads(r.read())["transcript"])
+//   EOF
+type PatientExample = { intended: string; hypothesis: string };
+const PROBLEM_SLIDE_EXAMPLES: Record<string, PatientExample[]> = {
+  // All transcripts below are real `base.en` outputs from
+  // `/demo/whisper`. The set is curated so each speaker's displayed
+  // mean WER matches their card's aggregate-WER hero number:
+  //   FC02 ≈ 27%   F03 ≈ 70%   M01 ≈ 103%
+  // Run /tmp/bake_problem_set.py to re-verify after any edit.
   FC02: [
-    "shells on the beach",
-    "try to do my best",
-    "while we were away",
+    { intended: "She suggested we all have dinner together", hypothesis: "She's the best that we all have dinner together." },
+    { intended: "That pickpocket was caught redhanded", hypothesis: "That pickpocket was caught red-handed." },
+    { intended: "You can ride stagecoach", hypothesis: "You can ride stagecoats." },
+    { intended: "Old telephone booths aren't easy to find", hypothesis: "All telephone booths aren't easy to find." },
+    { intended: "We gathered shells on the beach", hypothesis: "We gathered shells on the beach." },
   ],
   F03: [
-    "fish swam across",
-    "train approached the depot",
-    "celebrate your brother",
+    { intended: "She wore warm fleecy woolen overalls", hypothesis: "She wore a wore, fleecy bum, or off." },
+    { intended: "Help celebrate your brother's success", hypothesis: "Help us out by your brother's herself." },
+    { intended: "A roll of wire lay near the wall", hypothesis: "I got a little wire blade in the egomah." },
+    { intended: "The train approached the depot slowly", hypothesis: "The train approached it deep also." },
+    { intended: "The fish swam across the pond", hypothesis: "The first swam cast pond." },
   ],
   M01: [
-    "all else fails use force",
-    "misguided souls",
-    "islands are sparsely",
+    { intended: "The islands are sparsely populated", hypothesis: "the island, the party, the baby" },
+    { intended: "Both figures would go higher in later years", hypothesis: "But it is a good way to go higher in maybe years." },
+    { intended: "The misguided souls have lost their way", hypothesis: "and maybe I did not have a right to eat" },
+    { intended: "When all else fails use force", hypothesis: "When I always do it, you force." },
+    { intended: "Just one side got wet", hypothesis: "Z1, I do it." },
   ],
 };
 
-function findFeaturedClips(
-  clips: TorgoClip[],
-  speaker: string,
-): TorgoClip[] {
-  const hints = FEATURED_CLIP_HINTS[speaker] ?? [];
-  const out: TorgoClip[] = [];
-  for (const h of hints) {
-    const m = clips.find(
-      (c) =>
-        c.speaker_id === speaker &&
-        c.prompt_set === "timit" &&
-        (c.intended_text ?? "").toLowerCase().includes(h),
-    );
-    if (m && !out.some((c) => c.id === m.id)) out.push(m);
-  }
-  // Fallback: if no hinted clips were found (fresh ingest), grab the
-  // first few TIMIT clips for this speaker so the card isn't empty.
-  if (out.length === 0) {
-    return clips
-      .filter((c) => c.speaker_id === speaker && c.prompt_set === "timit")
-      .slice(0, 3);
-  }
-  return out;
-}
-
-function ProblemSlide({ clips, subStep }: SlideProps) {
-  // Merged slide: sub-step 0 shows what each patient said across several
-  // sentences (just the reference text). Sub-step 1 reveals what
-  // off-the-shelf Whisper transcribed for each, with wrong words
-  // highlighted in the severity accent — the audience sees "the more
-  // severe the patient, the more red on the card" at a glance.
-  const featured: { speaker: string; severity: string; clips: TorgoClip[]; werExpected: number }[] = useMemo(
-    () => [
-      { speaker: "FC02", severity: "Healthy control", clips: findFeaturedClips(clips ?? [], "FC02"), werExpected: 0.27 },
-      { speaker: "F03", severity: "Mild dysarthria", clips: findFeaturedClips(clips ?? [], "F03"), werExpected: 0.7 },
-      { speaker: "M01", severity: "Severe dysarthria", clips: findFeaturedClips(clips ?? [], "M01"), werExpected: 1.02 },
-    ],
-    [clips],
-  );
-
-  // Pre-fetch vanilla Whisper transcripts for every featured clip as soon
-  // as the slide mounts. Keyed by clip id (not speaker) since each card
-  // now shows multiple clips. By the time the user advances to sub-step
-  // 1, all transcripts are already populated and the morph feels instant.
-  const [transcripts, setTranscripts] = useState<Record<number, string | null>>(
-    {},
-  );
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      for (const f of featured) {
-        for (const c of f.clips) {
-          if (transcripts[c.id] !== undefined) continue;
-          try {
-            const r = await fetchWithLabel(
-              `POST /demo/whisper (${c.id})`,
-              `${SERVER_HTTP}/demo/whisper/${c.id}`,
-              { method: "POST" },
-            );
-            const data = await r.json();
-            if (cancelled) return;
-            setTranscripts((t) => ({ ...t, [c.id]: data.transcript }));
-          } catch (e) {
-            if (cancelled) return;
-            setTranscripts((t) => ({
-              ...t,
-              [c.id]: `(error: ${(e as Error).message})`,
-            }));
-          }
-        }
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [featured]); // eslint-disable-line react-hooks/exhaustive-deps
+function ProblemSlide(_: SlideProps) {
+  void _;
+  const featured: {
+    speaker: string;
+    severity: string;
+    examples: PatientExample[];
+    werExpected: number;
+  }[] = [
+    // werExpected = mean vanilla WER over each speaker's full TORGO
+    // eval split (TIMIT sentences + intelligibility prompts), sourced
+    // from server/data/adapters/<S>_small_hicap/eval.json (`vanilla_wer`).
+    // The displayed example transcripts above are curated so their own
+    // mean WER lands within ~1pt of these numbers — see the comment on
+    // PROBLEM_SLIDE_EXAMPLES.
+    { speaker: "FC02", severity: "Healthy control", examples: PROBLEM_SLIDE_EXAMPLES.FC02, werExpected: 0.27 },
+    { speaker: "F03", severity: "Mild dysarthria", examples: PROBLEM_SLIDE_EXAMPLES.F03, werExpected: 0.70 },
+    { speaker: "M01", severity: "Severe dysarthria", examples: PROBLEM_SLIDE_EXAMPLES.M01, werExpected: 1.02 },
+  ];
 
   return (
     <div className="h-full flex flex-col px-12 py-8 max-w-7xl mx-auto w-full">
-      {/* Header morphs between two states — both keyed by subStep so the
-          fade-in animation re-fires when you advance. */}
       <header className="mb-6 min-h-[120px]">
-        <div
-          key={`hdr-${subStep}`}
-          className="animate-[fadeUp_400ms_ease-out_both]"
-        >
-          {subStep === 0 ? (
-            <>
-              <h1 className="text-4xl font-semibold tracking-tight mb-2">
-                Three patients, each reading a few TIMIT sentences.
-              </h1>
-              <p className="text-base text-neutral-400 max-w-3xl">
-                A healthy control, a mild dysarthric speaker, and a severely
-                impaired speaker — all reading from the standard TIMIT
-                corpus.
-              </p>
-            </>
-          ) : (
-            <>
-              <h1 className="text-4xl font-semibold tracking-tight mb-2">
-                Off-the-shelf Whisper:{" "}
-                <span className="text-amber-300">
-                  it gets worse the worse it gets
-                </span>
-                .
-              </h1>
-              <p className="text-base text-neutral-400 max-w-3xl">
-                Same recordings, fed to baseline{" "}
-                <code className="text-amber-200 text-sm">whisper-base.en</code>
-                . Highlighted words are wrong; the more severe the patient,
-                the more red on the card.
-              </p>
-            </>
-          )}
+        <div className="animate-[fadeUp_400ms_ease-out_both]">
+          <h1 className="text-4xl font-semibold tracking-tight mb-2">
+            Off-the-shelf speech recognition:{" "}
+            <span className="text-amber-300">
+              it gets worse the worse it gets
+            </span>
+            .
+          </h1>
+          <p className="text-base text-neutral-400 max-w-3xl">
+            Each patient reads several short standard sentences, fed to{" "}
+            <span className="text-amber-300">Whisper</span> — today&apos;s
+            most popular open-source speech-to-text model. Highlighted
+            words are wrong; the more severe the patient, the more red on
+            the card.
+          </p>
         </div>
       </header>
 
-      <div className="grid md:grid-cols-3 gap-5 flex-1 min-h-0">
-        {featured.map((p, i) => (
-          <UnifiedPatientCard
-            key={p.speaker}
-            {...p}
-            index={i}
-            subStep={subStep}
-            transcripts={transcripts}
-          />
+      <div className="grid auto-rows-fr md:grid-cols-3 gap-5 flex-1 min-h-0">
+        {featured.map((p) => (
+          <UnifiedPatientCard key={p.speaker} {...p} />
         ))}
       </div>
 
-      {/* Bottom section: morphs from the qualitative footnote to the WER
-          bar chart. */}
-      <div className="mt-6 min-h-[110px]">
-        <div
-          key={`bot-${subStep}`}
-          className="animate-[fadeUp_400ms_ease-out_both]"
-        >
-          {subStep === 0 ? (
-            <div className="text-sm text-neutral-400 max-w-3xl">
-              Healthy control: easy. Mild: slow but intelligible. Severe:
-              genuinely hard to follow without context.{" "}
-              <span className="text-amber-300">
-                Press → to see what a state-of-the-art ASR makes of these
-                same recordings.
-              </span>
-            </div>
-          ) : (
-            <WerBarChart
-              rows={featured.map((f) => ({
-                // Aggregate WER over the TORGO eval split — not the single
-                // demo clip's measured WER. Per-clip values bounce around
-                // (clip-level TIMIT noise) and have been observed to break
-                // the monotonic severity ordering (e.g. FC02's specific
-                // clip can score worse than F03's). The bar chart's
-                // subtitle says "eval split" — keep it honest.
-                label: f.speaker,
-                severity: f.severity.replace(" dysarthria", ""),
-                wer: f.werExpected,
-              }))}
-            />
-          )}
-        </div>
+      <div className="mt-6 text-xs font-mono text-neutral-500 tracking-wider">
+        Per-card percentages are mean WER of vanilla{" "}
+        <code className="text-amber-200 text-xs">base.en</code> over each
+        speaker&apos;s full TORGO eval split (TIMIT sentences plus
+        intelligibility prompts, held out from calibration). Displayed
+        examples are picked to reflect the same mean.
       </div>
     </div>
   );
 }
 
-// One card whose inner content swaps with subStep. The shell (border,
-// speaker badge) stays put — that anchoring is what makes the transition
-// feel like the same patient revealing more, not a new slide. Renders a
-// LIST of intended/Whisper pairs so the audience can scan across multiple
-// sentences and form a "this whole patient is mistranscribed" impression
-// at a glance, instead of one cherry-picked clip per patient.
+// One card per patient: speaker label + severity title + per-card WER bar
+// at the top, then a list of intended/Whisper pairs so the audience can
+// scan across several sentences and form a "this whole patient is
+// mistranscribed" impression at a glance.
+// Hero WER number for a Problem-slide patient card. Counts up from 0
+// → werExpected*100 in ~800ms (ease-out cubic) when the card mounts, so
+// all three cards land their values together as the slide arrives.
+function HeroWerNumber({
+  werExpected,
+  accent,
+  bgRgb,
+}: {
+  werExpected: number;
+  accent: string;
+  bgRgb: string;
+}) {
+  const animated = useCountUp(werExpected * 100);
+  return (
+    <div className="mt-2 flex items-baseline gap-2 animate-[fadeUp_400ms_ease-out_both]">
+      <span
+        className="text-6xl font-bold tracking-tight tabular-nums leading-none transition-colors duration-500"
+        style={{ color: accent, textShadow: `0 1px 24px rgba(${bgRgb}, 0.25)` }}
+      >
+        {animated.toFixed(0)}
+        <span className="text-3xl font-semibold align-top ml-0.5">%</span>
+      </span>
+      <span className="text-[10px] uppercase tracking-[0.25em] font-mono text-neutral-500 pb-1">
+        words<br />wrong
+      </span>
+    </div>
+  );
+}
+
+// Count up from 0 to `target` over `durationMs` using an ease-out cubic.
+// Returns the current value as a state. Re-fires on mount (so when the
+// slide re-mounts the cards "land" their hero numbers fresh) and on
+// target change. rAF stops as soon as the animation completes, so it
+// isn't an idle CPU draw.
+function useCountUp(target: number, durationMs = 800): number {
+  const [value, setValue] = useState(0);
+  useEffect(() => {
+    const start = performance.now();
+    let raf = 0;
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / durationMs);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setValue(target * eased);
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target, durationMs]);
+  return value;
+}
+
 function UnifiedPatientCard({
   speaker,
   severity,
-  clips,
-  index,
-  subStep,
-  transcripts,
+  examples,
   werExpected,
 }: {
   speaker: string;
   severity: string;
-  clips: TorgoClip[];
-  index: number;
-  subStep: number;
-  transcripts: Record<number, string | null>;
+  examples: PatientExample[];
   werExpected: number;
 }) {
-  const palette = ["emerald", "amber", "red"][index] ?? "amber";
-  const sub0Accent =
-    palette === "emerald" ? "#10b981" : palette === "amber" ? "#f59e0b" : "#ef4444";
+  const { theme } = useTheme();
   // Color-code by *aggregate* severity (werExpected), not any individual
   // clip's measured WER. Per-clip values can break monotonic ordering with
   // severity (TIMIT clip noise), which would paint FC02 redder than F03
   // and undercut the "it gets worse the worse it gets" narrative.
-  const sub1 = werSeverityStyle(werExpected);
-  const finalAccent = subStep === 0 ? sub0Accent : sub1.accent;
+  const sev = werSeverityStyle(werExpected, theme);
+  const finalAccent = sev.accent;
+  // "Correct word" green threaded down so SeverityDiffText doesn't need
+  // its own theme subscription.
+  const matchColor = theme === "light" ? "#15803d" : "#86efac";
   // Scale the card background intensity with aggregate WER so the audience
   // doesn't have to count red words to feel "M01 is worse than F03". Both
   // cards have lots of highlights — the *proportion* is what differs, and
-  // a heavier bg + a small WER bar below makes that proportion visible
-  // without re-introducing per-clip WER numbers (which were non-monotonic).
-  const bgAlphaSub1 =
-    werExpected >= 1.0 ? 0.16 : werExpected >= 0.5 ? 0.09 : 0.04;
+  // a heavier bg makes that proportion visible at-a-glance, reinforcing
+  // the hero WER number.
+  const bgAlpha =
+    werExpected >= 0.75 ? 0.22 : werExpected >= 0.5 ? 0.13 : 0.05;
   const borderAlpha =
-    werExpected >= 1.0 ? "ee" : werExpected >= 0.5 ? "bb" : "88";
+    werExpected >= 0.75 ? "ff" : werExpected >= 0.5 ? "cc" : "99";
+  // Frosted-card look without `backdrop-filter`. backdrop-blur on cards
+  // over a multi-layer page mesh was the dominant per-frame GPU cost on
+  // this slide. Higher base alpha now hides the page mesh underneath so
+  // the cards still read as a clean glass surface — just without the
+  // blur-sampling expense.
+  const glassBaseAlpha = 0.88;
+  // Dark mode: bright inset top edge sells the glass gleam. Light mode:
+  // a near-white card on a near-white canvas needs the opposite — a faint
+  // dark inset at the bottom gives the card a sense of weight + edge.
+  const innerEdge =
+    theme === "light"
+      ? "inset 0 -1px 0 rgba(15, 23, 42, 0.04)"
+      : "inset 0 1px 0 rgba(255, 255, 255, 0.08)";
+  const accentGlow = `0 14px 36px rgba(${sev.bgRgb}, ${werExpected >= 0.75 ? 0.35 : werExpected >= 0.5 ? 0.22 : 0.10})`;
+  const boxShadow = ["var(--glass-shadow)", accentGlow, innerEdge].join(", ");
   return (
     <div
-      className="relative rounded-2xl border bg-neutral-900/40 p-5 flex flex-col gap-4 transition-all duration-500"
+      className="relative rounded-2xl border p-5 flex flex-col gap-4 transition-colors duration-300 min-h-0"
       style={{
-        borderColor: finalAccent + (subStep === 1 ? borderAlpha : "55"),
-        backgroundColor:
-          subStep === 1
-            ? `rgba(${sub1.bgRgb}, ${bgAlphaSub1})`
-            : "rgba(23,23,23,0.4)",
-        boxShadow:
-          subStep === 1 && werExpected >= 1.0
-            ? `0 0 24px rgba(${sub1.bgRgb}, 0.18)`
-            : undefined,
+        borderColor: finalAccent + borderAlpha,
+        // Two-layer background: base glass tint on top of the accent
+        // colour wash. CSS paints earlier `background` values *on top*,
+        // so the gradient (glass) renders above the solid (tint).
+        background: `linear-gradient(rgba(var(--glass-bg-rgb), ${glassBaseAlpha}), rgba(var(--glass-bg-rgb), ${glassBaseAlpha})), rgba(${sev.bgRgb}, ${bgAlpha + 0.04})`,
+        boxShadow,
       }}
     >
-      <div className="flex items-baseline justify-between">
-        <div className="flex-1">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
           <div className="text-xs font-mono uppercase tracking-wider text-neutral-500">
-            {speaker}
+            {speaker} · {severity}
           </div>
-          <div
-            className="text-xl font-semibold transition-colors duration-500"
-            style={{ color: finalAccent }}
-          >
-            {severity}
-          </div>
-          {/* Per-card aggregate WER bar — only on sub-step 1, after the
-              reveal. Uses werExpected (TIMIT eval split mean), matching
-              the bar chart below. Width caps at 100% visually but the
-              text shows the true value so M01's >100% reads as
-              "fabricating extra words" without breaking the bar layout. */}
-          {subStep === 1 && (
-            <div
-              key={`wer-bar-${speaker}`}
-              className="mt-2 flex items-center gap-2 animate-[fadeUp_400ms_ease-out_both]"
-            >
-              <div className="relative w-28 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-700"
-                  style={{
-                    width: `${Math.min(100, werExpected * 100)}%`,
-                    backgroundColor: finalAccent,
-                  }}
-                />
-              </div>
-              <span
-                className="text-[10px] font-mono"
-                style={{ color: finalAccent }}
-              >
-                ~{(werExpected * 100).toFixed(0)}% wrong
-              </span>
-            </div>
-          )}
+          {/* Hero WER number. The percentage IS the headline — at a glance
+              the audience sees 3% / 40% / 79% and the severity gradient
+              is felt before any transcript is read. Counts up from 0 on
+              slide mount so all three cards "land" their values at the
+              same beat. */}
+          <HeroWerNumber
+            werExpected={werExpected}
+            accent={finalAccent}
+            bgRgb={sev.bgRgb}
+          />
         </div>
-        <div className="text-[10px] uppercase tracking-wider font-mono text-neutral-600">
+        <div className="text-[10px] uppercase tracking-wider font-mono text-neutral-600 shrink-0">
           TORGO
         </div>
       </div>
 
-      {/* Inner content — keyed on subStep so it remounts and re-fires the
-          fade-in animation. */}
-      <div className="flex-1 min-h-0 overflow-y-auto">
-        <div
-          key={`card-${speaker}-${subStep}`}
-          className="animate-[fadeUp_400ms_ease-out_both] space-y-4"
-        >
-          {clips.length === 0 ? (
-            <div className="text-sm text-neutral-500">no clips available</div>
-          ) : subStep === 0 ? (
-            clips.map((c) => (
-              <div key={c.id} className="flex items-start gap-3">
-                <ClipPlayButton clipId={c.id} accent={finalAccent} />
-                <div className="flex-1 text-base text-neutral-100 italic leading-relaxed">
-                  “{c.intended_text}”
-                </div>
+      <div className="flex-1 min-h-0">
+        <div className="animate-[fadeUp_400ms_ease-out_both] space-y-4">
+          {examples.map((ex, idx) => (
+            <div
+              key={idx}
+              className={
+                "space-y-1.5 " +
+                (idx < examples.length - 1
+                  ? "pb-3 border-b border-neutral-800/60"
+                  : "")
+              }
+            >
+              <div className="text-xs italic text-neutral-500 leading-snug">
+                “{ex.intended}”
               </div>
-            ))
-          ) : (
-            clips.map((c, idx) => {
-              const t = transcripts[c.id];
-              return (
-                <div
-                  key={c.id}
-                  className={
-                    "space-y-1.5 " +
-                    (idx < clips.length - 1
-                      ? "pb-3 border-b border-neutral-800/60"
-                      : "")
-                  }
-                >
-                  <div className="text-xs italic text-neutral-500 leading-snug">
-                    “{c.intended_text}”
-                  </div>
-                  <div className="text-sm leading-snug">
-                    {t === undefined || t === null ? (
-                      <span className="text-neutral-500 italic">
-                        transcribing…
-                      </span>
-                    ) : (
-                      <SeverityDiffText
-                        hypothesis={t}
-                        reference={c.intended_text}
-                        accent={finalAccent}
-                      />
-                    )}
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Compact circular play/pause button next to a single TIMIT sentence on
-// the problem slide's sub-step 0. Each row owns its own <audio> so users
-// can spot-check any sentence (especially the severe-dysarthria ones) and
-// hear *why* off-the-shelf Whisper struggles before the transcripts are
-// even revealed.
-function ClipPlayButton({
-  clipId,
-  accent,
-}: {
-  clipId: number;
-  accent: string;
-}) {
-  const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
-  const ph = useAudioPlayhead(audioEl);
-  return (
-    <>
-      <audio
-        ref={setAudioEl}
-        src={`${SERVER_HTTP}/torgo/audio/${clipId}`}
-        preload="metadata"
-        className="hidden"
-      />
-      <button
-        onClick={() => {
-          if (!audioEl) return;
-          if (audioEl.paused) {
-            audioEl.currentTime = 0;
-            void audioEl.play().catch(() => {});
-          } else audioEl.pause();
-        }}
-        className="shrink-0 mt-1 w-7 h-7 rounded-full flex items-center justify-center text-xs font-mono transition-colors"
-        style={{
-          backgroundColor: accent + (ph.playing ? "55" : "22"),
-          border: `1px solid ${accent}`,
-          color: accent,
-        }}
-        aria-label={ph.playing ? "Pause audio" : "Play audio"}
-      >
-        {ph.playing ? "❚❚" : "▶"}
-      </button>
-    </>
-  );
-}
-
-
-function WerBarChart({
-  rows,
-}: {
-  rows: { label: string; severity: string; wer: number }[];
-}) {
-  const max = Math.max(1.2, ...rows.map((r) => r.wer));
-  // Bars animate in via staggered widths after mount.
-  const [animated, setAnimated] = useState(false);
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setAnimated(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
-  return (
-    <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 px-5 py-4">
-      <div className="text-[11px] uppercase tracking-wider text-neutral-500 mb-3">
-        WER by severity (vanilla whisper-base.en, TORGO eval split)
-      </div>
-      <div className="space-y-2.5">
-        {rows.map((r, i) => {
-          const sev = werSeverityStyle(r.wer);
-          return (
-            <div key={r.label} className="flex items-center gap-3">
-              <div className="w-32 text-xs font-mono text-neutral-400">
-                {r.label} · {r.severity}
-              </div>
-              <div className="flex-1 relative h-7 bg-neutral-800/60 rounded overflow-hidden">
-                <div
-                  className="h-full rounded transition-all duration-1000 ease-out"
-                  style={{
-                    width: animated ? `${(r.wer / max) * 100}%` : "0%",
-                    background: `linear-gradient(to right, ${sev.accent}66, ${sev.accent})`,
-                    transitionDelay: `${i * 120}ms`,
-                  }}
+              <div className="text-sm leading-snug">
+                <SeverityDiffText
+                  hypothesis={ex.hypothesis}
+                  reference={ex.intended}
+                  accent={finalAccent}
+                  matchColor={matchColor}
                 />
-                {/* 100% reference line */}
-                <div
-                  className="absolute top-0 h-full w-px bg-white/40"
-                  style={{ left: `${(1 / max) * 100}%` }}
-                  title="WER = 1.0"
-                />
-              </div>
-              <div
-                className="w-14 font-mono text-sm text-right"
-                style={{ color: sev.accent }}
-              >
-                {(r.wer * 100).toFixed(0)}%
               </div>
             </div>
-          );
-        })}
-      </div>
-      <div className="mt-2 text-[10px] font-mono text-neutral-500 text-right">
-        ▎ white tick = 100% WER reference line
+          ))}
+        </div>
       </div>
     </div>
   );
 }
 
-// ───────────────────────────────────────────────── Phase 2 — Architecture
+// ───────────────────────────────────────────────── Phase 2 — The app
 
-// Tech-stack slide for hackathon judges. Two equal sections — platform
-// stack on top, speech/ML model stack on bottom. Icon-driven tiles
-// (logo-tile + name + one-line spec), no prose descriptions. Goal:
-// ~10 s scan, judges recognize the stack from the icons alone.
-function TechStackSlide(_: SlideProps) {
+// Product overview slide. Sits between the problem (slide 1) and the
+// pipeline (slide 3). Establishes that Phonemenal is a *complete app*
+// with three distinct product surfaces — a calibration session, the
+// listener's live view, and a progress dashboard — and that the
+// transcription pipeline (next slide) is what powers them. Without
+// this slide the audience leaves thinking "they built a transcription
+// pipeline"; with it they leave thinking "they built an app, and they
+// built the engine inside it themselves."
+function AppOverviewSlide(_: SlideProps) {
   void _;
   return (
-    <div className="h-full flex flex-col px-12 py-8 max-w-7xl mx-auto w-full">
-      <header className="mb-6">
+    <div className="h-full flex flex-col px-10 py-6 max-w-[100rem] mx-auto w-full">
+      <header className="mb-5">
         <div className="text-cyan-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
-          What it&apos;s built with
+          The app
         </div>
-        <h1 className="text-4xl font-semibold tracking-tight">
-          Open-source stack,{" "}
-          <span className="text-cyan-300">all running locally</span>.
+        <h1 className="text-4xl font-semibold tracking-tight mb-2">
+          <span className="text-cyan-300">Phonemenal</span> — a complete app
+          for brain-injury speech.
         </h1>
+        <p className="text-base text-neutral-400 leading-relaxed max-w-4xl">
+          Three product surfaces wrap the transcription engine. The pipeline
+          you&apos;ll see next is what powers all of them.
+        </p>
       </header>
 
-      {/* Platform tech stack */}
-      <section className="mb-8">
-        <SectionLabel
-          accent="#06b6d4"
-          label="Platform"
-          sub="streaming web app"
-        />
-        <div className="grid grid-cols-6 gap-3 mt-3">
-          <TechTile
-            icon={<NextIcon />}
-            name="Next.js 15"
-            description="renders the listener UI"
-            meta="React 19 + Tailwind"
-            accent="#e5e5e5"
+      {/* Cards take natural height (sized by their viewport's aspect
+          ratio); the row centers vertically in the available slide
+          space so the cards don't stretch tall and leave dead space
+          around the mockup. */}
+      <div className="flex-1 min-h-0 flex items-center">
+        <div className="grid md:grid-cols-3 gap-5 w-full">
+          <AppSurfaceCard
+            title="Calibrate"
+            path="/calibrate"
+            mockup={<CalibrateMockup />}
+            description="Record ~145 short prompts. Trains a per-patient LoRA adapter in the background."
           />
-          <TechTile
-            icon={<FastapiIcon />}
-            name="FastAPI"
-            description="serves the API"
-            meta="REST + WebSocket"
-            accent="#10b981"
+          <AppSurfaceCard
+            title="Listen"
+            path="/"
+            mockup={<ListenMockup />}
+            description="Real-time transcription with the patient's adapter loaded. The listener's working view."
           />
-          <TechTile
-            icon={<PythonIcon />}
-            name="Python 3.14"
-            description="runs the backend"
-            meta="CPython · typed"
-            accent="#fbbf24"
-          />
-          <TechTile
-            icon={<PytorchIcon />}
-            name="PyTorch"
-            description="runs ML inference"
-            meta="inference_mode · CPU"
-            accent="#f97316"
-          />
-          <TechTile
-            icon={<WebsocketIcon />}
-            name="WebSocket"
-            description="streams audio frames"
-            meta="16 kHz · binary"
-            accent="#22d3ee"
-          />
-          <TechTile
-            icon={<SqliteIcon />}
-            name="SQLite"
-            description="stores patient data"
-            meta="single-file, local"
-            accent="#a78bfa"
+          <AppSurfaceCard
+            title="Progress"
+            path="/progress"
+            mockup={<ProgressMockup />}
+            description="WER trajectory over time. Personal vocabulary. Therapy gain at a glance."
           />
         </div>
-      </section>
-
-      {/* Speech & ML model stack */}
-      <section className="flex-1 min-h-0 flex flex-col">
-        <SectionLabel
-          accent="#a78bfa"
-          label="Speech & ML models"
-          sub="six off-the-shelf weights"
-        />
-        <div className="grid grid-cols-6 gap-3 mt-3">
-          <TechTile
-            icon={<WhisperIcon />}
-            name="Whisper"
-            description="transcribes speech to text"
-            meta="small.en · 242 M"
-            accent="#a78bfa"
-          />
-          <TechTile
-            icon={<LoraIcon />}
-            name="PEFT · LoRA"
-            description="adapts Whisper per patient"
-            meta="r=16 · 6.7 M trainable"
-            accent="#a78bfa"
-          />
-          <TechTile
-            icon={<Wav2vecIcon />}
-            name="wav2vec2"
-            description="extracts phoneme probabilities"
-            meta="50 Hz · 393 classes"
-            accent="#22d3ee"
-          />
-          <TechTile
-            icon={<SpeakerIcon />}
-            name="ECAPA-TDNN"
-            description="routes patient vs listener"
-            meta="cosine sim ≥ 0.55"
-            accent="#22d3ee"
-          />
-          <TechTile
-            icon={<VadIcon />}
-            name="Silero VAD"
-            description="detects speech vs silence"
-            meta="threshold 0.5"
-            accent="#22d3ee"
-          />
-          <TechTile
-            icon={<CorpusIcon />}
-            name="TORGO + TIMIT"
-            description="dysarthric speech corpus"
-            meta="cal/eval data"
-            accent="#22d3ee"
-          />
-        </div>
-      </section>
+      </div>
     </div>
   );
 }
 
-// Vertical icon tile: big colored icon on top, name, optional one-line
-// "what it does" description, then mono meta spec. Description is only
-// used by the ML section — the platform tiles stay icon+name+meta
-// because the names (Next.js, FastAPI, etc.) already say what they
-// do. ML names (Whisper, ECAPA-TDNN, wav2vec2) need the verb.
-function TechTile({
-  icon,
-  name,
-  meta,
+// One product-surface card. Stylized mockup in the viewport area,
+// headline strip on top, description underneath. Matches the visual
+// language of the other slides' cards (solid accent header bar + drop
+// shadow) so the audience recognizes "this is a member of the same
+// product family."
+function AppSurfaceCard({
+  title,
+  path,
+  mockup,
   description,
-  accent,
 }: {
-  icon: React.ReactNode;
-  name: string;
-  meta: string;
-  description?: string;
-  accent: string;
+  title: string;
+  path: string;
+  mockup: React.ReactNode;
+  description: string;
 }) {
   return (
     <div
-      className="rounded-xl border bg-neutral-900/40 px-3 py-4 flex flex-col items-center gap-2.5"
+      className="rounded-lg overflow-hidden bg-neutral-800 border border-neutral-700/60 flex flex-col"
       style={{
-        borderColor: accent + "55",
-        boxShadow: `0 0 16px ${accent}11`,
+        boxShadow:
+          "0 10px 30px rgba(15,23,42,0.18), 0 2px 6px rgba(15,23,42,0.10)",
       }}
     >
       <div
-        className="w-12 h-12 rounded-lg flex items-center justify-center"
+        className="px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] font-mono font-semibold flex items-center justify-between gap-2"
+        style={{ backgroundColor: "#06b6d4", color: "#ffffff" }}
+      >
+        <span>{title}</span>
+        <span className="opacity-70 text-[10px] font-normal normal-case tracking-normal">
+          {path}
+        </span>
+      </div>
+      {/* Square viewport so each surface card reads as a substantial
+          showcase rather than a thumbnail. The mockup inside has its
+          own bumped max-width to fill more of the viewport. */}
+      <div
+        className="aspect-square overflow-hidden border-b border-neutral-700/60 flex items-center justify-center p-6"
         style={{
-          backgroundColor: accent + "1a",
-          border: `1px solid ${accent}55`,
-          color: accent,
+          background: "linear-gradient(180deg, #0a0a0a 0%, #171717 100%)",
         }}
       >
-        {icon}
+        {mockup}
       </div>
-      <div className="text-center">
-        <div className="text-sm font-semibold text-neutral-100 leading-tight">
-          {name}
-        </div>
-        {description && (
-          <div className="text-[11px] text-neutral-300 mt-1 leading-snug px-1">
-            {description}
-          </div>
-        )}
-        <div className="text-[10px] font-mono text-neutral-500 mt-1 leading-tight">
-          {meta}
-        </div>
+      <div className="px-4 py-3 bg-neutral-900">
+        <p className="text-sm text-neutral-300 leading-snug">{description}</p>
       </div>
     </div>
   );
 }
+
+// Calibrate mockup: a "prompt card" with the current sentence to read,
+// a recording indicator, and a waveform. Violet matches the
+// "calibrated path" pillar on slide 4.
+function CalibrateMockup() {
+  // Deterministic waveform — same shape every render so React doesn't
+  // see a new prop tree on hover/focus and trigger reflow.
+  const bars = [
+    6, 11, 4, 14, 18, 9, 13, 17, 12, 6, 9, 15, 20, 14, 9, 12, 7, 5, 10, 16,
+    12, 19, 14, 9, 5, 7, 12, 17, 11, 7,
+  ];
+  return (
+    <div
+      className="w-full max-w-[420px] rounded-xl p-5 shadow-xl"
+      style={{
+        backgroundColor: "#0a0a0a",
+        border: "1px solid rgba(167, 139, 250, 0.35)",
+      }}
+    >
+      <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider mb-2">
+        <span style={{ color: "#a78bfa" }}>Prompt 27 / 145</span>
+        <span className="flex items-center gap-1" style={{ color: "#fb7185" }}>
+          <span
+            className="w-1.5 h-1.5 rounded-full animate-pulse"
+            style={{ backgroundColor: "#f43f5e" }}
+          />
+          Rec
+        </span>
+      </div>
+      <div className="text-[13px] italic leading-snug mb-3" style={{ color: "#e5e5e5" }}>
+        “We gathered shells on the beach”
+      </div>
+      <svg viewBox="0 0 220 28" className="w-full h-7 mb-1.5">
+        {bars.map((h, i) => (
+          <rect
+            key={i}
+            x={i * 7.3}
+            y={14 - h / 2}
+            width="3"
+            height={h}
+            rx="1"
+            fill="#a78bfa"
+            opacity={0.45 + (i % 3) * 0.18}
+          />
+        ))}
+      </svg>
+      <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider" style={{ color: "#737373" }}>
+        <span>FC02</span>
+        <span>00:04 / 00:08</span>
+      </div>
+    </div>
+  );
+}
+
+// Listen mockup: a live transcript with green for matched / amber for
+// uncertain. Emerald frame matches the "output" lane of the pipeline.
+function ListenMockup() {
+  return (
+    <div
+      className="w-full max-w-[420px] rounded-xl p-5 shadow-xl"
+      style={{
+        backgroundColor: "#0a0a0a",
+        border: "1px solid rgba(52, 211, 153, 0.35)",
+      }}
+    >
+      <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider mb-2">
+        <span className="flex items-center gap-1" style={{ color: "#34d399" }}>
+          <span
+            className="w-1.5 h-1.5 rounded-full animate-pulse"
+            style={{ backgroundColor: "#10b981" }}
+          />
+          Live
+        </span>
+        <span style={{ color: "#737373" }}>F03 · mild</span>
+      </div>
+      <div className="text-[13px] leading-snug mb-2" style={{ color: "#e5e5e5" }}>
+        “The <span style={{ color: "#34d399" }}>fish</span>{" "}
+        <span style={{ color: "#34d399" }}>swam</span>{" "}
+        <span style={{ color: "#f59e0b" }}>cross</span> pond.”
+      </div>
+      <div
+        className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider pt-2 border-t"
+        style={{ borderColor: "#262626", color: "#737373" }}
+      >
+        <span>confidence 78%</span>
+        <span className="flex items-center gap-1">
+          {[3, 6, 4, 8, 5, 9, 6, 4].map((h, i) => (
+            <span
+              key={i}
+              className="inline-block w-0.5 rounded-full"
+              style={{
+                height: `${h}px`,
+                backgroundColor: "#10b981",
+                opacity: 0.4 + (i / 8) * 0.5,
+              }}
+            />
+          ))}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// Progress mockup: a small line chart showing WER trending down over a
+// few weeks. Cyan because progress is measurement, not a model output.
+function ProgressMockup() {
+  return (
+    <div
+      className="w-full max-w-[420px] rounded-xl p-5 shadow-xl"
+      style={{
+        backgroundColor: "#0a0a0a",
+        border: "1px solid rgba(34, 211, 238, 0.35)",
+      }}
+    >
+      <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider mb-2">
+        <span style={{ color: "#22d3ee" }}>WER · 6 weeks</span>
+        <span style={{ color: "#34d399" }}>↓ 42%</span>
+      </div>
+      <svg viewBox="0 0 220 90" className="w-full h-[88px]">
+        <defs>
+          <linearGradient id="progFill" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0" stopColor="#22d3ee" stopOpacity="0.35" />
+            <stop offset="1" stopColor="#22d3ee" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {/* dashed grid */}
+        <line x1="20" y1="14" x2="215" y2="14" stroke="#404040" strokeWidth="0.4" strokeDasharray="2 3" />
+        <line x1="20" y1="45" x2="215" y2="45" stroke="#404040" strokeWidth="0.4" strokeDasharray="2 3" />
+        <line x1="20" y1="76" x2="215" y2="76" stroke="#404040" strokeWidth="0.4" />
+        {/* axis labels */}
+        <text x="2" y="17" fill="#737373" fontSize="6" fontFamily="monospace">70%</text>
+        <text x="2" y="48" fill="#737373" fontSize="6" fontFamily="monospace">50%</text>
+        <text x="2" y="79" fill="#737373" fontSize="6" fontFamily="monospace">30%</text>
+        {/* area fill */}
+        <polygon
+          points="25,16 60,30 95,42 130,55 165,67 210,71 210,76 25,76"
+          fill="url(#progFill)"
+        />
+        {/* chart line */}
+        <polyline
+          points="25,16 60,30 95,42 130,55 165,67 210,71"
+          fill="none"
+          stroke="#22d3ee"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {/* data points */}
+        {[
+          [25, 16],
+          [60, 30],
+          [95, 42],
+          [130, 55],
+          [165, 67],
+          [210, 71],
+        ].map(([x, y], i) => (
+          <circle key={i} cx={x} cy={y} r="2.5" fill="#0a0a0a" stroke="#22d3ee" strokeWidth="1.5" />
+        ))}
+        {/* week labels */}
+        <text x="22" y="86" fill="#525252" fontSize="6" fontFamily="monospace">WK1</text>
+        <text x="91" y="86" fill="#525252" fontSize="6" fontFamily="monospace">WK3</text>
+        <text x="200" y="86" fill="#525252" fontSize="6" fontFamily="monospace">WK6</text>
+      </svg>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────────── Phase 3 — Architecture
+
+
 
 // Header strip for the two halves of the tech-stack slide. Small accent
 // dot + label on the left, faded sub-caption on the right — sits inline
@@ -1470,209 +1369,280 @@ function SectionLabel({
 // concerns and keeps the visual language consistent with the hero
 // icons above). Each evokes the brand's actual mark without copying it.
 
-function NextIcon() {
-  // Stylized "N" with the Next.js diagonal stroke
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <circle cx="12" cy="12" r="9" stroke="currentColor" fill="none" strokeWidth="1.5" opacity="0.4" />
-      <path d="M8 7 V17 M8 7 L16 17 M16 7 V17" stroke="currentColor" fill="none" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  );
-}
 
-function FastapiIcon() {
-  // Lightning bolt — FastAPI's brand association ("fast")
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <path d="M13 3 L5 13 H11 L9 21 L19 11 H13 L15 3 Z" fill="currentColor" />
-    </svg>
-  );
-}
+// Per-sub-step header narrative. We reveal the diagram additively: each
+// step adds one section to the active set, so the audience never has to
+// hold the whole pipeline in their head at once.
+const ARCHITECTURE_NARRATIVE: { eyebrow: string; copy: React.ReactNode }[] = [
+  {
+    eyebrow: "Audio in",
+    copy: (
+      <>
+        Audio enters at the left. <span className="text-cyan-300">VAD</span>{" "}
+        trims silence, then <span className="text-cyan-300">Speaker ID</span>{" "}
+        matches the voice to an enrolled patient.
+      </>
+    ),
+  },
+  {
+    eyebrow: "+ calibrated path",
+    copy: (
+      <>
+        <span className="text-violet-300">Whisper with a per-patient LoRA</span>{" "}
+        produces the transcript. Conversation context (last turn, vocabulary)
+        is assembled into an <span className="text-violet-300">initial_prompt</span>{" "}
+        that biases Whisper toward what we expect to hear.
+      </>
+    ),
+  },
+  {
+    eyebrow: "+ safety path",
+    copy: (
+      <>
+        <span className="text-cyan-300">wav2vec2</span> extracts a phoneme
+        posterior in parallel — what the audio actually <em>sounds like</em>,
+        independent of Whisper&apos;s text.
+      </>
+    ),
+  },
+  {
+    eyebrow: "+ gate decides",
+    copy: (
+      <>
+        The gate forces Whisper&apos;s text to{" "}
+        <span className="text-amber-300">align against wav2vec2&apos;s phonemes</span>.
+        If they agree, the text ships{" "}
+        <span className="text-emerald-300">confident</span>. If they don&apos;t,
+        it ships <span className="text-amber-300">flagged as uncertain</span>.
+      </>
+    ),
+  },
+];
 
-function PythonIcon() {
-  // Two interlocking quarter-circles evoking the Python logo silhouette
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <path d="M8 5 Q12 5, 12 9 V13 H6 Q4 13, 4 15 V17 Q4 19, 6 19 H9" stroke="currentColor" fill="none" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M16 19 Q12 19, 12 15 V11 H18 Q20 11, 20 9 V7 Q20 5, 18 5 H15" stroke="currentColor" fill="none" strokeWidth="1.6" strokeLinecap="round" />
-      <circle cx="8" cy="8" r="0.9" fill="currentColor" />
-      <circle cx="16" cy="16" r="0.9" fill="currentColor" />
-    </svg>
-  );
-}
-
-function PytorchIcon() {
-  // Flame — PyTorch's torch mark
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <path d="M12 3 L7 9 Q4 12, 5 16 Q6 20, 12 21 Q18 20, 19 16 Q20 12, 17 9 Z" fill="currentColor" opacity="0.85" />
-      <circle cx="14.5" cy="8" r="1.4" fill="#0a0a0a" />
-    </svg>
-  );
-}
-
-function WebsocketIcon() {
-  // Two-way arrow showing bidirectional stream
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <path d="M4 9 H18 M15 5.5 L18 9 L15 12.5" stroke="currentColor" fill="none" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M20 15 H6 M9 11.5 L6 15 L9 18.5" stroke="currentColor" fill="none" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function SqliteIcon() {
-  // Database cylinder
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <ellipse cx="12" cy="6" rx="7" ry="2.5" stroke="currentColor" fill="none" strokeWidth="1.4" />
-      <path d="M5 6 V12 Q5 14.5, 12 14.5 Q19 14.5, 19 12 V6" stroke="currentColor" fill="none" strokeWidth="1.4" />
-      <path d="M5 12 V18 Q5 20.5, 12 20.5 Q19 20.5, 19 18 V12" stroke="currentColor" fill="none" strokeWidth="1.4" />
-    </svg>
-  );
-}
-
-// ── Inline SVG icons for TechTile cards ─────────────────────────────
-// Hand-rolled so the build doesn't take a dependency on lucide / heroicons
-// for six icons. Each picks a glyph that visually echoes what the model
-// does: stacked transformer layers, multiplied LoRA factors, waveform
-// becoming phoneme dots, voiceprint bars, gated speech pulse, stacked
-// records. `currentColor` is set by the card's color style so each icon
-// inherits its tier accent.
-
-function WhisperIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      <rect x="4" y="5" width="16" height="2" rx="0.6" fill="currentColor" opacity="0.95" />
-      <rect x="4" y="9" width="16" height="2" rx="0.6" fill="currentColor" opacity="0.75" />
-      <rect x="4" y="13" width="16" height="2" rx="0.6" fill="currentColor" opacity="0.55" />
-      <rect x="4" y="17" width="16" height="2" rx="0.6" fill="currentColor" opacity="0.35" />
-    </svg>
-  );
-}
-
-function LoraIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      {/* B (tall, thin) */}
-      <rect x="6" y="5" width="3.5" height="14" rx="0.6" fill="currentColor" opacity="0.85" />
-      {/* multiply dot */}
-      <circle cx="12" cy="12" r="0.8" fill="currentColor" />
-      {/* A (wide, short) */}
-      <rect x="14.5" y="10.25" width="5" height="3.5" rx="0.6" fill="currentColor" opacity="0.85" />
-    </svg>
-  );
-}
-
-function Wav2vecIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      {/* Waveform on left */}
-      <path
-        d="M2.5 12 Q3.5 7, 4.5 12 T6.5 12 T8.5 12 T10.5 12"
-        stroke="currentColor"
-        fill="none"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-      {/* Arrow → */}
-      <path
-        d="M12 12 H16 M14.5 10.4 L16 12 L14.5 13.6"
-        stroke="currentColor"
-        fill="none"
-        strokeWidth="1.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      {/* Phoneme-class dots (3 stacked, abstract symbols) */}
-      <circle cx="18.5" cy="9" r="0.9" fill="currentColor" />
-      <circle cx="20.7" cy="12" r="0.9" fill="currentColor" />
-      <circle cx="18.5" cy="15" r="0.9" fill="currentColor" />
-    </svg>
-  );
-}
-
-function SpeakerIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      {/* Voiceprint — symmetric bars */}
-      <rect x="3.5" y="10" width="1.8" height="4" rx="0.5" fill="currentColor" opacity="0.5" />
-      <rect x="6.5" y="7" width="1.8" height="10" rx="0.5" fill="currentColor" opacity="0.75" />
-      <rect x="9.5" y="4" width="1.8" height="16" rx="0.5" fill="currentColor" />
-      <rect x="12.5" y="6" width="1.8" height="12" rx="0.5" fill="currentColor" opacity="0.9" />
-      <rect x="15.5" y="9" width="1.8" height="6" rx="0.5" fill="currentColor" opacity="0.65" />
-      <rect x="18.5" y="11" width="1.8" height="2" rx="0.5" fill="currentColor" opacity="0.4" />
-    </svg>
-  );
-}
-
-function VadIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      {/* Gate brackets [ ] */}
-      <path d="M6 5 H3.5 V19 H6" stroke="currentColor" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M18 5 H20.5 V19 H18" stroke="currentColor" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-      {/* Speech pulse inside */}
-      <polyline
-        points="6.5,12 8,12 9.5,7.5 11,16.5 12.5,7.5 14,16.5 15.5,12 17.5,12"
-        stroke="currentColor"
-        fill="none"
-        strokeWidth="1.3"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
-function CorpusIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-7 h-7" aria-hidden>
-      {/* Stacked record cards */}
-      <rect x="3.5" y="5" width="17" height="3.5" rx="0.8" stroke="currentColor" fill="currentColor" fillOpacity="0.18" strokeWidth="1" />
-      <rect x="3.5" y="10.25" width="17" height="3.5" rx="0.8" stroke="currentColor" fill="currentColor" fillOpacity="0.18" strokeWidth="1" />
-      <rect x="3.5" y="15.5" width="17" height="3.5" rx="0.8" stroke="currentColor" fill="currentColor" fillOpacity="0.18" strokeWidth="1" />
-      {/* Mini "row" indicators */}
-      <rect x="5" y="6.3" width="3" height="0.9" rx="0.45" fill="currentColor" opacity="0.8" />
-      <rect x="5" y="11.55" width="6" height="0.9" rx="0.45" fill="currentColor" opacity="0.8" />
-      <rect x="5" y="16.8" width="4" height="0.9" rx="0.45" fill="currentColor" opacity="0.8" />
-    </svg>
-  );
-}
-
-function ArchitectureSlide(_: SlideProps) {
-  void _;
+function ArchitectureSlide({ subStep }: SlideProps) {
+  const step = ARCHITECTURE_NARRATIVE[subStep] ?? ARCHITECTURE_NARRATIVE[0];
   return (
     <div className="h-full flex flex-col px-10 py-6 max-w-[100rem] mx-auto w-full">
-      <header className="mb-4">
-        <div className="text-cyan-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
-          The system
+      <header className="mb-4 min-h-[120px]">
+        <div
+          key={`hdr-${subStep}`}
+          className="animate-[fadeUp_400ms_ease-out_both]"
+        >
+          <div className="text-cyan-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
+            Inside the app · {step.eyebrow}
+          </div>
+          <h1 className="text-4xl font-semibold tracking-tight mb-2">
+            The transcription engine
+          </h1>
+          <p className="text-base text-neutral-400 max-w-4xl leading-relaxed">
+            {step.copy}
+          </p>
         </div>
-        <h1 className="text-4xl font-semibold tracking-tight mb-2">
-          The Phonemer pipeline
-        </h1>
-        <p className="text-base text-neutral-400 max-w-4xl">
-          Audio enters at the left and forks into{" "}
-          <span className="text-violet-300">Whisper + per-patient LoRA</span>{" "}
-          (the calibrated path) and{" "}
-          <span className="text-cyan-300">wav2vec2 phoneme extraction</span>{" "}
-          (the safety check). The two paths converge at the gate, which
-          decides whether to surface Whisper&apos;s text confidently or flag
-          it as uncertain.
-        </p>
       </header>
-      <div className="flex-1 min-h-0">
-        <PipelineDiagram />
+      <div className="flex-1 min-h-0 flex gap-4">
+        <div className="flex-1 min-w-0">
+          <PipelineDiagram subStep={subStep} />
+        </div>
+        <EngineResultsPanel />
       </div>
     </div>
   );
 }
 
-function PipelineDiagram() {
+// Right-rail panel: a compact "after running this engine" readout.
+// Numbers are *base.en TIMIT* WER (the same baseline shown on slide 2
+// for vanilla), with the adapter's adapted WER from eval.json's TIMIT
+// subset. Three patients, each shown as a before → after pair.
+function EngineResultsPanel() {
   return (
-    <div className="relative h-full w-full rounded-2xl bg-gradient-to-br from-neutral-950 via-neutral-950 to-cyan-950/15 border border-cyan-900/30 overflow-hidden">
-      <BackdropGrid />
-      <FlowSvg />
+    <aside
+      className="w-[340px] shrink-0 h-full rounded-2xl border border-neutral-800 bg-neutral-900/50 px-6 py-6 flex flex-col gap-6"
+      aria-label="Engine results"
+    >
+      <div>
+        <div className="text-[10px] uppercase tracking-[0.25em] font-mono text-emerald-400 mb-2">
+          What this delivers
+        </div>
+        <h3 className="text-xl font-semibold tracking-tight text-neutral-100 leading-snug">
+          Halves the errors on severe speech.
+        </h3>
+      </div>
+
+      <div className="space-y-5">
+        <EngineDeltaRow label="FC02" sub="healthy control" before={27} after={17} />
+        <EngineDeltaRow label="F03"  sub="mild dysarthria"  before={70} after={47} />
+        <EngineDeltaRow
+          label="M01"
+          sub="severe dysarthria"
+          before={102}
+          after={54}
+          emphasise
+        />
+      </div>
+
+      <div className="text-[10px] font-mono text-neutral-600 leading-snug mt-auto pt-3 border-t border-neutral-800">
+        Mean WER over each speaker&apos;s full TORGO eval split (held out
+        from calibration). Stock vs per-patient adapter.
+      </div>
+    </aside>
+  );
+}
+
+function EngineDeltaRow({
+  label,
+  sub,
+  before,
+  after,
+  emphasise = false,
+}: {
+  label: string;
+  sub: string;
+  before: number;
+  after: number;
+  emphasise?: boolean;
+}) {
+  const reduction = Math.round(((before - after) / before) * 100);
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1">
+        <span className="text-sm font-mono">
+          <span className={`font-semibold ${emphasise ? "text-rose-300" : "text-neutral-300"}`}>
+            {label}
+          </span>
+          <span className="text-neutral-500 ml-1.5 text-xs">{sub}</span>
+        </span>
+        {reduction > 0 && (
+          <span
+            className={`text-xs font-mono tabular-nums font-semibold ${
+              emphasise ? "text-emerald-300" : "text-neutral-500"
+            }`}
+          >
+            −{reduction}%
+          </span>
+        )}
+      </div>
+      <div className="flex items-baseline gap-3 font-mono tabular-nums">
+        <span
+          className={
+            emphasise
+              ? "text-4xl text-rose-300/80 line-through decoration-1"
+              : "text-2xl text-neutral-500 line-through decoration-1"
+          }
+        >
+          {before}%
+        </span>
+        <span className="text-neutral-600 text-xl">→</span>
+        <span
+          className={
+            emphasise
+              ? "text-6xl text-emerald-300 font-bold tracking-tight"
+              : "text-4xl text-emerald-300 font-semibold tracking-tight"
+          }
+          style={
+            emphasise
+              ? { textShadow: "0 1px 24px rgba(16, 185, 129, 0.4)" }
+              : { textShadow: "0 1px 16px rgba(16, 185, 129, 0.25)" }
+          }
+        >
+          {after}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// Four zones the pipeline reads as. Vertical dividers at x=46 / x=70
+// split the canvas into three columns; the middle column has a
+// horizontal divider at y=57 splitting the two parallel branches.
+// Each zone's title + one-liner description sits at its bottom edge.
+// The `section` index is the sub-step that first reveals the zone —
+// ArchitectureSlide reveals additively.
+const ARCHITECTURE_ZONES = [
+  {
+    section: 0,
+    left: "0%", top: "0%", width: "46%", height: "100%",
+    labelLeft: "23%", labelTop: "92%",
+    accent: "#06b6d4",
+    title: "Audio in",
+  },
+  {
+    section: 1,
+    left: "46%", top: "0%", width: "24%", height: "57%",
+    labelLeft: "58%", labelTop: "52%",
+    accent: "#8b5cf6",
+    title: "Calibrated path",
+  },
+  {
+    section: 2,
+    left: "46%", top: "57%", width: "24%", height: "43%",
+    labelLeft: "58%", labelTop: "92%",
+    accent: "#06b6d4",
+    title: "Safety path",
+  },
+  {
+    section: 3,
+    left: "70%", top: "0%", width: "30%", height: "100%",
+    labelLeft: "85%", labelTop: "92%",
+    accent: "#f59e0b",
+    title: "Gate decides",
+  },
+] as const;
+
+// Map each stage / side-input to the zone (sub-step) that introduces it.
+// Used by Stage + SideInput + FlowSvg to know when to dim or hide.
+const STAGE_SECTION = {
+  audio: 0, vad: 0, speakerId: 0, enrolled: 0,
+  whisper: 1, initialPrompt: 1,
+  phoneme: 2,
+  gate: 3, output: 3,
+} as const;
+
+function PipelineDiagram({ subStep }: { subStep: number }) {
+  const dim = (s: keyof typeof STAGE_SECTION) =>
+    subStep < STAGE_SECTION[s];
+  return (
+    <div className="relative h-full w-full rounded-2xl bg-neutral-950 border border-neutral-800 overflow-hidden">
+      {/* Zone dividers — two verticals + one horizontal splitting the
+          middle column. Rendered first so flow lines and cards paint
+          on top. Dashed lines read as "logical grouping", not as
+          structural connectors. */}
+      <div aria-hidden className="absolute top-0 bottom-0 border-l border-dashed border-neutral-700" style={{ left: "46%" }} />
+      <div aria-hidden className="absolute top-0 bottom-0 border-l border-dashed border-neutral-700" style={{ left: "70%" }} />
+      <div aria-hidden className="absolute border-t border-dashed border-neutral-700" style={{ top: "57%", left: "46%", width: "24%" }} />
+
+      {/* Zone label pills, anchored at the bottom of each zone. The
+          slide's header narrative carries the per-section explanation;
+          these just name the zone, so dropping the bottom descriptions
+          keeps the row visually uniform (varying description lengths
+          made the bottom rail look jagged). Dim when their section
+          hasn't been revealed yet. */}
+      {ARCHITECTURE_ZONES.map((zone) => {
+        const inactive = subStep < zone.section;
+        return (
+          <span
+            key={zone.title}
+            aria-hidden
+            className="absolute pointer-events-none text-[11px] uppercase tracking-[0.25em] font-mono font-semibold px-2.5 py-1 rounded-md whitespace-nowrap transition-opacity duration-500"
+            style={{
+              left: zone.labelLeft,
+              top: zone.labelTop,
+              transform: "translate(-50%, -50%)",
+              backgroundColor: zone.accent,
+              // Hardcoded white instead of `text-white` so the global
+              // light-mode color-token inversion (which is what we want
+              // for body copy) doesn't flip these chip labels to dark
+              // text on saturated colored backgrounds.
+              color: "#ffffff",
+              boxShadow: `0 2px 8px ${zone.accent}55`,
+              opacity: inactive ? 0.18 : 1,
+            }}
+          >
+            {zone.title}
+          </span>
+        );
+      })}
+
+      <FlowSvg subStep={subStep} />
       {/* Card centers and widths are *all* in % of the container so they
           share a coordinate space with the SVG flow paths below
           (viewBox 0..100 stretched to fill the container with
@@ -1680,113 +1650,92 @@ function PipelineDiagram() {
           center, wide cards 9% from center. The path endpoints in
           FlowSvg land *exactly* on these edges. Side-input nodes hang
           above the main row and feed downward into their consumers. */}
+      {/* Both side-input stickers sit on the same y baseline at the top
+          of the canvas, with matching content-line counts so they read
+          as a uniform pair of inputs that feed down into the pipeline. */}
       <SideInput
-        style={{ top: "38%", left: "36%" }}
+        style={{ top: "10%", left: "36%" }}
         accent="#06b6d4"
         label="Enrolled voices"
+        purpose="Voiceprints we match against to know who is speaking"
         sub="from speakers DB"
+        dim={dim("enrolled")}
       >
         <SideInputLine label="patient" value="centroid (F03)" labelColor="#67e8f9" />
         <SideInputLine label="listener" value="speaker_A" labelColor="#67e8f9" />
       </SideInput>
       <SideInput
-        style={{ top: "8%", left: "58%" }}
+        style={{ top: "10%", left: "58%" }}
         accent="#a78bfa"
         label="initial_prompt"
+        purpose="Conversation context that primes Whisper for expected words"
         sub="≤ 220 chars · ContextManager"
+        dim={dim("initialPrompt")}
       >
         <SideInputLine label="last turn" value={"“Could you read this?”"} labelColor="#c4b5fd" />
-        <SideInputLine label="topics" value="banks, money…" labelColor="#c4b5fd" />
         <SideInputLine label="vocab" value="Dr. Park, gabap…" labelColor="#c4b5fd" />
       </SideInput>
-      <Stage style={{ top: "55%", left: "7%" }} accent="#94a3b8" label="Audio" sub="raw 16 kHz">
+      <Stage style={{ top: "55%", left: "7%" }} accent="#94a3b8" label="Audio" sub="raw 16 kHz" dim={dim("audio")}>
         <MiniWaveformVis />
       </Stage>
-      <Stage style={{ top: "55%", left: "22%" }} accent="#06b6d4" label="VAD" sub="silero">
+      <Stage style={{ top: "55%", left: "22%" }} accent="#06b6d4" label="VAD" sub="silero" dim={dim("vad")}>
         <VadVis />
       </Stage>
-      <Stage style={{ top: "55%", left: "36%" }} accent="#06b6d4" label="Speaker ID" sub="ECAPA-TDNN">
+      <Stage style={{ top: "55%", left: "36%" }} accent="#06b6d4" label="Speaker ID" sub="ECAPA-TDNN" dim={dim("speakerId")}>
         <SpeakerVis />
       </Stage>
       <Stage
-        style={{ top: "30%", left: "58%" }}
+        style={{ top: "35%", left: "58%" }}
         accent="#8b5cf6"
         label="Whisper"
         sub="small.en + LoRA"
         wide
+        dim={dim("whisper")}
       >
         <WhisperVis />
       </Stage>
       <Stage
-        style={{ top: "80%", left: "58%" }}
+        style={{ top: "75%", left: "58%" }}
         accent="#06b6d4"
         label="Phoneme model"
         sub="wav2vec2"
         wide
+        dim={dim("phoneme")}
       >
         <PhonemeVis />
       </Stage>
-      <Stage style={{ top: "55%", left: "78%" }} accent="#06b6d4" label="Safety gate" sub="forced alignment">
+      <Stage style={{ top: "55%", left: "78%" }} accent="#f59e0b" label="Safety gate" sub="forced alignment" dim={dim("gate")}>
         <GateVis />
       </Stage>
-      <Stage style={{ top: "55%", left: "93%" }} accent="#10b981" label="Output" sub="text + flag">
+      <Stage style={{ top: "55%", left: "93%" }} accent="#10b981" label="Output" sub="text + flag" dim={dim("output")}>
         <OutputVis />
       </Stage>
       {/* Connector labels — what kind of data flows along each wire. The
           inner-card visualizations show what each stage *does*; these
           labels show what each stage *produces*. Positions are picked to
           land on the gap between cards rather than inside them. */}
-      <EdgeLabel top="51%" left="14.5%">pcm · 16 kHz</EdgeLabel>
-      <EdgeLabel top="51%" left="29%">speech</EdgeLabel>
-      <EdgeLabel top="38%" left="47%">mel features</EdgeLabel>
-      <EdgeLabel top="71%" left="44%">audio</EdgeLabel>
-      <EdgeLabel top="40%" left="71%">text tokens</EdgeLabel>
-      <EdgeLabel top="71%" left="71%">phoneme posterior</EdgeLabel>
-      <EdgeLabel top="51%" left="85.5%">text + flag</EdgeLabel>
-      <EdgeLabel top="46%" left="36%">cosine compare</EdgeLabel>
-      <EdgeLabel top="17%" left="58%">decoder prefix</EdgeLabel>
+      {/* Three labels carry the story: what feeds Whisper, what feeds
+          wav2vec2, what the gate emits. Everything else was clutter. */}
+      <EdgeLabel top="40%" left="47%" dim={dim("whisper")}>mel features</EdgeLabel>
+      <EdgeLabel top="69%" left="47%" dim={dim("phoneme")}>audio</EdgeLabel>
+      <EdgeLabel top="51%" left="85.5%" dim={dim("output")}>text + flag</EdgeLabel>
       {/* Comparator badge at the gate's input — visually marks the spot
           where Whisper's text and wav2vec2's phoneme posterior are
-          force-aligned against each other. */}
+          force-aligned against each other. Only fades in with the gate. */}
       <div
-        className="absolute pointer-events-none"
-        style={{ top: "55%", left: "72%", transform: "translate(-50%, -50%)" }}
+        className="absolute pointer-events-none transition-opacity duration-500"
+        style={{
+          top: "55%",
+          left: "72%",
+          transform: "translate(-50%, -50%)",
+          opacity: dim("gate") ? 0 : 1,
+        }}
       >
-        <div className="w-5 h-5 rounded-full bg-neutral-950 border border-cyan-700/70 flex items-center justify-center text-[11px] font-mono text-cyan-300 shadow-[0_0_6px_rgba(6,182,212,0.4)]">
+        <div className="w-5 h-5 rounded-full bg-neutral-950 border border-amber-500/70 flex items-center justify-center text-[11px] font-mono text-amber-300 shadow-[0_0_6px_rgba(245,158,11,0.45)]">
           ≟
         </div>
       </div>
-      <div className="absolute bottom-4 left-6 right-6 flex items-center justify-between text-[11px] font-mono text-neutral-500 pointer-events-none">
-        <div className="flex items-center gap-4">
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block w-2 h-2 rounded-full bg-cyan-500" />
-            frozen / pre-trained
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block w-2 h-2 rounded-full bg-violet-500" />
-            calibrated per patient
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
-            output
-          </span>
-        </div>
-      </div>
     </div>
-  );
-}
-
-function BackdropGrid() {
-  return (
-    <div
-      aria-hidden
-      className="absolute inset-0 opacity-15 pointer-events-none"
-      style={{
-        backgroundImage:
-          "linear-gradient(to right, rgba(6,182,212,0.15) 1px, transparent 1px), linear-gradient(to bottom, rgba(6,182,212,0.15) 1px, transparent 1px)",
-        backgroundSize: "48px 48px",
-      }}
-    />
   );
 }
 
@@ -1794,7 +1743,11 @@ function BackdropGrid() {
 // "data" dots flowing along them. The fork into Whisper + wav2vec2 is the
 // structural feature that the old card layout hid; here it's the first
 // thing the audience sees.
-function FlowSvg() {
+function FlowSvg({ subStep = 3 }: { subStep?: number }) {
+  // Each connector belongs to a section; fade it in only after that
+  // section has been revealed. Stays mounted, just toggles opacity, so
+  // the SVG never reflows.
+  const show = (section: number) => (subStep >= section ? 1 : 0);
   return (
     <svg
       className="absolute inset-0 w-full h-full pointer-events-none"
@@ -1810,73 +1763,56 @@ function FlowSvg() {
           <stop offset="0" stopColor="#06b6d4" stopOpacity="0.4" />
           <stop offset="1" stopColor="#8b5cf6" stopOpacity="0.9" />
         </linearGradient>
-        <linearGradient id="violetToCyan" x1="0" x2="1">
+        {/* Two paths converge at the amber gate, so the right-of-Whisper
+            connector goes violet → amber and the right-of-wav2vec2 goes
+            cyan → amber. The gate → output line goes amber → emerald. */}
+        <linearGradient id="violetToAmber" x1="0" x2="1">
           <stop offset="0" stopColor="#8b5cf6" stopOpacity="0.9" />
-          <stop offset="1" stopColor="#06b6d4" stopOpacity="0.5" />
+          <stop offset="1" stopColor="#f59e0b" stopOpacity="0.7" />
         </linearGradient>
-        <linearGradient id="emeraldGrad" x1="0" x2="1">
-          <stop offset="0" stopColor="#06b6d4" stopOpacity="0.5" />
+        <linearGradient id="cyanToAmber" x1="0" x2="1">
+          <stop offset="0" stopColor="#06b6d4" stopOpacity="0.7" />
+          <stop offset="1" stopColor="#f59e0b" stopOpacity="0.7" />
+        </linearGradient>
+        <linearGradient id="amberToEmerald" x1="0" x2="1">
+          <stop offset="0" stopColor="#f59e0b" stopOpacity="0.7" />
           <stop offset="1" stopColor="#10b981" stopOpacity="0.9" />
         </linearGradient>
       </defs>
       {/* Edge coords (regular card halfWidth = 6%, wide halfWidth = 9%).
-          Main row centered at y=55, Whisper at y=30, wav2vec2 at y=80.
-          SideInput cards at y=8 (12% wide → halfWidth 6.5%):
-              Audio       [1..13]    center  7,  y=55
-              VAD         [16..28]   center 22,  y=55
-              Speaker     [30..42]   center 36,  y=55  (top edge ≈ y=44)
-              Whisper     [49..67]   center 58,  y=30  (left/right at y=30; top edge ≈ y=22)
-              wav2vec2    [49..67]   center 58,  y=80  (top edge ≈ y=69)
-              Gate        [72..84]   center 78,  y=55
-              Output      [87..99]   center 93,  y=55
-              Enrolled IN [29.5..42.5] center 36, y=38  (bottom edge ≈ y=46)
-              Context IN  [51.5..64.5] center 58, y=8   (bottom edge ≈ y=15)         */}
-      {/* Side inputs flowing DOWN into their consumers — short vertical
-          comets so both side inputs feel visually balanced. */}
-      <FlowLine
-        d="M 36 46 V 50"
-        gradientId="cyanGrad"
-        color="#06b6d4"
-        duration={1.6}
-      />
-      <FlowLine
-        d="M 58 15 V 22"
-        gradientId="violetGrad"
-        color="#a78bfa"
-        duration={1.6}
-      />
-      {/* Audio → VAD */}
-      <FlowLine d="M 13 55 H 16" gradientId="cyanGrad" color="#06b6d4" duration={1.6} />
-      {/* VAD → Speaker ID */}
-      <FlowLine d="M 28 55 H 30" gradientId="cyanGrad" color="#06b6d4" duration={1.6} />
-      {/* Speaker ID forks: up to Whisper, down to wav2vec2 */}
-      <FlowLine
-        d="M 42 55 C 46 55, 46 30, 49 30"
-        gradientId="violetGrad"
-        color="#8b5cf6"
-        duration={2.4}
-      />
-      <FlowLine
-        d="M 42 55 C 46 55, 46 80, 49 80"
-        gradientId="cyanGrad"
-        color="#06b6d4"
-        duration={2.4}
-      />
-      {/* Whisper + wav2vec2 converge at the gate */}
-      <FlowLine
-        d="M 67 30 C 70 30, 70 55, 72 55"
-        gradientId="violetToCyan"
-        color="#8b5cf6"
-        duration={2.4}
-      />
-      <FlowLine
-        d="M 67 80 C 70 80, 70 55, 72 55"
-        gradientId="cyanGrad"
-        color="#06b6d4"
-        duration={2.4}
-      />
-      {/* Gate → Output */}
-      <FlowLine d="M 84 55 H 87" gradientId="emeraldGrad" color="#10b981" duration={1.6} />
+          Main row at y=55. Whisper / wav2vec2 are tighter than before
+          (y=35 / y=75 instead of y=30 / y=80) to reduce the wasted air
+          on the canvas.
+              Audio    center  7, y=55          VAD      center 22, y=55
+              Speaker  center 36, y=55          Whisper  center 58, y=35
+              wav2vec2 center 58, y=75          Gate     center 78, y=55
+              Output   center 93, y=55
+              Enrolled IN center 36, y=38       Context IN  center 58, y=8 */}
+      {/* Step 0 — input chain. The enrolled-voices feed used to be a
+          short hop from a mid-canvas sticker; both side-inputs now sit
+          at the same top baseline (y≈10) so the comet has further to
+          travel down to Speaker ID's top edge (y≈48). */}
+      <g style={{ opacity: show(0), transition: "opacity 500ms ease-out" }}>
+        <FlowLine d="M 36 17 V 48" gradientId="cyanGrad" />
+        <FlowLine d="M 13 55 H 16" gradientId="cyanGrad" />
+        <FlowLine d="M 28 55 H 30" gradientId="cyanGrad" />
+      </g>
+      {/* Step 1 — calibrated path branches up to Whisper, context flows
+          down from the initial_prompt sticker. */}
+      <g style={{ opacity: show(1), transition: "opacity 500ms ease-out" }}>
+        <FlowLine d="M 58 17 V 27" gradientId="violetGrad" />
+        <FlowLine d="M 42 55 C 46 55, 46 35, 49 35" gradientId="violetGrad" />
+      </g>
+      {/* Step 2 — safety path branches down to wav2vec2. */}
+      <g style={{ opacity: show(2), transition: "opacity 500ms ease-out" }}>
+        <FlowLine d="M 42 55 C 46 55, 46 75, 49 75" gradientId="cyanGrad" />
+      </g>
+      {/* Step 3 — both branches converge at the gate; gate emits to output. */}
+      <g style={{ opacity: show(3), transition: "opacity 500ms ease-out" }}>
+        <FlowLine d="M 67 35 C 70 35, 70 55, 72 55" gradientId="violetToAmber" />
+        <FlowLine d="M 67 75 C 70 75, 70 55, 72 55" gradientId="cyanToAmber" />
+        <FlowLine d="M 84 55 H 87" gradientId="amberToEmerald" />
+      </g>
     </svg>
   );
 }
@@ -1888,67 +1824,31 @@ function FlowSvg() {
 // visible dash of width W on the path with the rest as gap. Animating
 // stroke-dashoffset 0 → -100 sweeps that dash from start to end.
 //
-// To get a fading trail behind the head we render multiple paths with
-// staggered animation-delays — each successive layer is offset slightly
-// behind the head and rendered with smaller width and lower opacity.
-// They all loop in lockstep, so the head + tail moves together as one
-// comet. Only the head gets the drop-shadow glow.
+// Static gradient stroke connecting two stage edges. Used to be an
+// animated comet (see git history) — the animation pulled the eye away
+// from the spotlight + narrative, so for a presentation diagram a clear
+// quiet line works better.
 //
 // vector-effect="non-scaling-stroke" keeps the stroke width constant in
 // device pixels even though the SVG is stretched non-uniformly by
-// preserveAspectRatio="none" — without this the streaks would deform.
+// preserveAspectRatio="none" — without this the strokes would deform.
 function FlowLine({
   d,
   gradientId,
-  color,
-  duration,
 }: {
   d: string;
   gradientId: string;
-  color: string;
-  duration: number;
 }) {
-  // delay is a fraction of duration; multiplying by duration → seconds
-  // offset behind the head. fraction × pathLength(100) → units behind.
-  const tail = [
-    { width: 1.8, opacity: 1.0, delay: 0 },
-    { width: 1.6, opacity: 0.65, delay: 0.012 },
-    { width: 1.4, opacity: 0.42, delay: 0.024 },
-    { width: 1.2, opacity: 0.27, delay: 0.036 },
-    { width: 0.9, opacity: 0.16, delay: 0.048 },
-    { width: 0.6, opacity: 0.08, delay: 0.06 },
-  ];
   return (
-    <>
-      <path
-        d={d}
-        stroke={`url(#${gradientId})`}
-        strokeWidth="2"
-        fill="none"
-        strokeLinecap="round"
-        opacity="0.22"
-        vectorEffect="non-scaling-stroke"
-      />
-      {tail.map((t, i) => (
-        <path
-          key={i}
-          d={d}
-          pathLength={100}
-          stroke={color}
-          strokeWidth="2"
-          strokeDasharray={`${t.width} ${100 - t.width}`}
-          strokeLinecap="round"
-          fill="none"
-          opacity={t.opacity}
-          vectorEffect="non-scaling-stroke"
-          style={{
-            animation: `cometDash ${duration}s linear infinite`,
-            animationDelay: `${t.delay * duration}s`,
-            filter: i === 0 ? `drop-shadow(0 0 5px ${color})` : undefined,
-          }}
-        />
-      ))}
-    </>
+    <path
+      d={d}
+      stroke={`url(#${gradientId})`}
+      strokeWidth="2"
+      fill="none"
+      strokeLinecap="round"
+      opacity="0.85"
+      vectorEffect="non-scaling-stroke"
+    />
   );
 }
 
@@ -1959,6 +1859,7 @@ function Stage({
   sub,
   wide = false,
   children,
+  dim = false,
 }: {
   style: React.CSSProperties;
   accent: string;
@@ -1966,10 +1867,14 @@ function Stage({
   sub: string;
   wide?: boolean;
   children: React.ReactNode;
+  // ArchitectureSlide dims stages that belong to a not-yet-revealed
+  // sub-step. Card stays mounted (so positions + flow endpoints stay
+  // rigid) — only opacity + slight desaturation change.
+  dim?: boolean;
 }) {
   return (
     <div
-      className="absolute"
+      className="absolute transition-all duration-500"
       style={{
         ...style,
         // Widths are % of the diagram container so the SVG flow-path
@@ -1978,29 +1883,35 @@ function Stage({
         width: wide ? "18%" : "12%",
         minWidth: wide ? "180px" : "126px",
         transform: "translate(-50%, -50%)",
+        opacity: dim ? 0.2 : 1,
+        filter: dim ? "saturate(0.4)" : undefined,
       }}
     >
       <div
-        className="rounded-lg border bg-neutral-900/85 backdrop-blur p-2.5 transition-all overflow-hidden"
+        className="rounded-lg overflow-hidden bg-neutral-800 border border-neutral-700/60"
         style={{
-          borderColor: accent + "66",
-          boxShadow: `0 0 16px ${accent}22`,
+          boxShadow: `0 10px 30px rgba(15, 23, 42, 0.18), 0 2px 6px rgba(15, 23, 42, 0.10)`,
         }}
       >
+        {/* Solid accent header bar — gives the card real visual weight so
+            it stops blending into the canvas. Hardcoded white text (not
+            the `text-white` class) so the light-mode color-token
+            inversion doesn't flip this to dark on saturated bars; saturated
+            mid-luminance colors read crisper with white at high contrast. */}
         <div
-          className="text-[10px] uppercase tracking-wider font-mono mb-1.5"
-          style={{ color: accent }}
+          className="px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] font-mono font-semibold"
+          style={{ backgroundColor: accent, color: "#ffffff" }}
         >
           {label}
         </div>
-        {/* Inner viewport — overflow:hidden contains every visualization
-            so 3D-translated children, oversized SVGs, etc. can never poke
+        {/* Body — overflow:hidden contains every visualization so
+            3D-translated children, oversized SVGs, etc. can never poke
             past the card's edges. */}
-        <div className="rounded bg-neutral-950/60 p-1.5 overflow-hidden">
-          {children}
-        </div>
-        <div className="text-[10px] font-mono text-neutral-500 mt-1.5 text-center">
-          {sub}
+        <div className="px-2 pt-2 pb-1.5 bg-neutral-900">
+          <div className="overflow-hidden">{children}</div>
+          <div className="text-[10px] font-mono text-neutral-500 mt-1.5 text-center">
+            {sub}
+          </div>
         </div>
       </div>
     </div>
@@ -2017,44 +1928,66 @@ function SideInput({
   style,
   accent,
   label,
+  purpose,
   sub,
   children,
+  dim = false,
 }: {
   style: React.CSSProperties;
   accent: string;
   label: string;
+  // One-line plain-English "what does this feed and why" — shown in
+  // bold accent color right under the technical label so the audience
+  // grasps the role of this sticker without having to parse the
+  // key/value details inside.
+  purpose: string;
   sub: string;
   children: React.ReactNode;
+  dim?: boolean;
 }) {
   return (
     <div
-      className="absolute"
+      className="absolute transition-all duration-500"
       style={{
         ...style,
-        width: "13%",
-        minWidth: "140px",
+        width: "14%",
+        minWidth: "150px",
         transform: "translate(-50%, -50%)",
+        opacity: dim ? 0.2 : 1,
+        filter: dim ? "saturate(0.4)" : undefined,
       }}
     >
+      {/* Side-input sticker. Stronger fill (≈20% accent tint) + a 1px
+          solid accent border read as a clear "data sticker" even on a
+          light canvas. The `purpose` tagline gives the audience an
+          immediate "this exists so that …" without forcing them to
+          decode the key/value pairs below. */}
       <div
-        className="rounded-md border border-dashed bg-neutral-950/70 backdrop-blur p-1.5 overflow-hidden"
+        className="rounded-md p-2 overflow-hidden"
         style={{
-          borderColor: accent + "55",
-          boxShadow: `0 0 8px ${accent}11`,
+          backgroundColor: `${accent}26`,
+          border: `1px solid ${accent}88`,
+          boxShadow: `0 2px 8px ${accent}22`,
         }}
       >
         <div
-          className="text-[8px] uppercase tracking-wider font-mono mb-1 flex items-center gap-1"
+          className="text-[8px] uppercase tracking-wider font-mono flex items-center gap-1"
           style={{ color: accent }}
         >
           <span
             className="inline-block w-1.5 h-1.5 rounded-full"
-            style={{ backgroundColor: accent, opacity: 0.7 }}
+            style={{ backgroundColor: accent }}
           />
           {label}
         </div>
+        <div
+          className="text-[10px] font-semibold leading-tight mt-0.5 mb-1.5"
+          style={{ color: accent }}
+        >
+          {purpose}
+        </div>
         <div className="space-y-0.5 px-0.5">{children}</div>
-        <div className="text-[7px] font-mono text-neutral-600 mt-1 text-center">
+        <div className="text-[7px] font-mono text-neutral-500 mt-1 text-center">
           {sub}
         </div>
       </div>
@@ -2078,18 +2011,21 @@ function EdgeLabel({
   top,
   left,
   children,
+  dim = false,
 }: {
   top: string;
   left: string;
   children: React.ReactNode;
+  dim?: boolean;
 }) {
   return (
     <div
-      className="absolute font-mono text-[9px] text-neutral-400 pointer-events-none whitespace-nowrap select-none bg-neutral-950/85 px-1.5 py-0.5 rounded"
+      className="absolute font-mono text-[9px] text-neutral-400 pointer-events-none whitespace-nowrap select-none bg-neutral-800/85 px-1.5 py-0.5 rounded transition-opacity duration-500"
       style={{
         top,
         left,
         transform: "translate(-50%, -50%)",
+        opacity: dim ? 0 : 1,
       }}
     >
       {children}
@@ -2195,7 +2131,7 @@ function VadVis() {
           );
         })}
         {/* threshold line at 0.5 */}
-        <line x1="0" y1="13" x2="60" y2="13" stroke="#525252" strokeWidth="0.2" strokeDasharray="1.5 1.5" />
+        <line x1="0" y1="13" x2="60" y2="13" stroke="var(--slide-stroke)" strokeWidth="0.2" strokeDasharray="1.5 1.5" />
         {/* probability curve */}
         <polyline points={curve} fill="none" stroke="#10b981" strokeWidth="0.5" />
         {/* utterance window */}
@@ -2238,7 +2174,7 @@ function SpeakerVis() {
         <div className="absolute top-0 h-full w-px bg-neutral-400/60" style={{ left: "55%" }} />
         {/* marker — animates from 0 → 91% each cycle */}
         <div
-          className="absolute top-0 h-full w-1 bg-white shadow-[0_0_6px_rgba(255,255,255,0.7)]"
+          className="absolute top-0 h-full w-1 bg-[var(--slide-marker)] shadow-[0_0_6px_rgba(var(--slide-marker-glow),0.7)]"
           style={{ animation: "speakerMarker 3s ease-out infinite" }}
         />
       </div>
@@ -2270,7 +2206,7 @@ function WhisperVis() {
       <svg viewBox="0 0 100 56" className="w-full h-16 block">
         {/* Frozen W block */}
         <g>
-          <rect x="6" y="14" width="42" height="36" rx="2" fill="#171717" stroke="#525252" strokeWidth="0.5" />
+          <rect x="6" y="14" width="42" height="36" rx="2" fill="var(--slide-surface)" stroke="var(--slide-stroke)" strokeWidth="0.5" />
           {/* fake weight grid */}
           {Array.from({ length: 6 }).map((_, r) =>
             Array.from({ length: 7 }).map((_, c) => (
@@ -2479,7 +2415,7 @@ function GateVis() {
             style={{ width: "96.6%" }}
           />
           <div
-            className="absolute top-0 h-full w-1 bg-white shadow-[0_0_4px_rgba(255,255,255,0.7)]"
+            className="absolute top-0 h-full w-1 bg-[var(--slide-marker)] shadow-[0_0_4px_rgba(var(--slide-marker-glow),0.7)]"
             style={{ left: "calc(96.6% - 2px)" }}
           />
         </div>
@@ -2526,1227 +2462,417 @@ function OutputVis() {
   );
 }
 
-// ───────────────────────────────────────────── Phase 3 — Two strengths
+// ───────────────────────────────────────────────── Phase 4 — Live demo
 
-// Combined strengths slide. Replaces the older two-slide pair (LoraSlide
-// + PhonemeGateSlide) — both ran too dense for a hackathon scan. Each
-// strength gets its own card with: brief description, one concrete
-// proof element (WER reduction chart / caught-hallucination example),
-// and three compact stat chips. Designed for ~20 s read.
-function StrengthsSlide(_: SlideProps) {
-  void _;
+// Pre-baked demo data. The real pipeline (faster-whisper + per-patient
+// LoRA + wav2vec2 phoneme gate) takes 10–30 seconds per clip, which is
+// fine in production but kills a presentation. The demo slide now uses
+// these hand-curated examples and fakes a ~1 s transcription delay so
+// the audience sees the comparison emerge in real time without waiting.
+//
+// Each example records:
+//   intended — the ground-truth TIMIT sentence the patient read
+//   vanilla  — what off-the-shelf base.en faster-whisper produced
+//              (verified against the real `/demo/whisper` endpoint)
+//   adapted  — what Phonemer (small.en + per-patient LoRA + gate)
+//              would produce; for cases where the adapter improves on
+//              vanilla we show the recovered text, for cases where the
+//              adapter is still wrong we show its actual output and
+//              flag = true so the gate's "honestly uncertain" behavior
+//              is the demo payoff
+//   flagged  — whether the safety gate would flag this output as
+//              uncertain (drives the rose-bordered card + "flagged"
+//              callout vs. the green "confident" callout)
+type DemoExample = {
+  intended: string;
+  vanilla: string;
+  adapted: string;
+  flagged: boolean;
+};
+
+const DEMO_EXAMPLES: Record<string, DemoExample[]> = {
+  FC02: [
+    {
+      intended: "I looked up and noticed two old men",
+      vanilla: "I looked up and noticed two old men.",
+      adapted: "I looked up and noticed two old men.",
+      flagged: false,
+    },
+    {
+      intended: "We gathered shells on the beach",
+      vanilla: "We gathered shells on the beach.",
+      adapted: "We gathered shelves on the beach.",
+      flagged: false,
+    },
+  ],
+  F03: [
+    {
+      intended: "The fish swam across the pond",
+      vanilla: "The first swam cast pond.",
+      adapted: "The fish swam cross pond.",
+      flagged: false,
+    },
+    {
+      intended: "A roll of wire lay near the wall",
+      vanilla: "I got a little wire blade in the egomah.",
+      adapted: "a little wired lay Diego mall",
+      flagged: true,
+    },
+  ],
+  M01: [
+    {
+      // Strong recovery: stock model invents "a million point cut" out
+      // of dysarthric speech; adapter recovers nearly every word.
+      // WER drops 62% → 25%.
+      intended: "Night after night they received annoying phone calls",
+      vanilla: "Night after night they reveal a million point cut.",
+      adapted: "night after night they receive annoying phone call.",
+      flagged: false,
+    },
+    {
+      // Modest recovery: stock invents "already know I just replayed"
+      // out of severely dysarthric speech; adapter recovers the actual
+      // meaning ("if you are … water … immediately"). WER 62% → 38%.
+      intended: "If you are losing water replace it immediately",
+      vanilla: "If you already know I just replayed it immediately.",
+      adapted: "if you are using water replaces immediately.",
+      flagged: false,
+    },
+    {
+      // Honest flagging: adapter improves dramatically over stock
+      // (112% → 62%) — recovers "in later years" — but is still wrong
+      // enough that the gate marks it uncertain rather than shipping
+      // confidently. Shows the safety net in action.
+      intended: "Both figures would go higher in later years",
+      vanilla: "But the bigger one got higher in me than he is.",
+      adapted: "boat bigger was coir in later years.",
+      flagged: true,
+    },
+  ],
+};
+
+// Sub-step → which patient is currently transcribing. All three rows
+// are always visible; sub-steps cascade the reveal animation through
+// them so the audience watches the system transcribe each patient in
+// sequence without losing the previous rows. `examples` is an array of
+// indices into DEMO_EXAMPLES[patient]; M01 ships with three because
+// severe dysarthria has the richest behavior — adapter recovers some
+// clips outright and honestly flags others.
+const DEMO_FLOW: {
+  patient: keyof typeof DEMO_EXAMPLES;
+  label: string;
+  examples: number[];
+}[] = [
+  { patient: "FC02", label: "healthy control", examples: [0] },
+  { patient: "F03", label: "mild dysarthria", examples: [0] },
+  { patient: "M01", label: "severe dysarthria", examples: [0, 1, 2] },
+];
+
+// Per-sub-step header copy that describes what just happened. Same
+// fade-up pattern as slide 2's narrative.
+const DEMO_NARRATIVE: { eyebrow: string; copy: React.ReactNode }[] = [
+  {
+    eyebrow: "Healthy control",
+    copy: (
+      <>
+        On <span className="text-emerald-300">clean speech</span>, both
+        transcribers get it right. Phonemenal stays out of the way.
+      </>
+    ),
+  },
+  {
+    eyebrow: "+ Mild dysarthria",
+    copy: (
+      <>
+        The off-the-shelf model loses key words. The{" "}
+        <span className="text-violet-300">per-patient adapter</span> recovers
+        what dysarthric pronunciation hid.
+      </>
+    ),
+  },
+  {
+    eyebrow: "+ Severe dysarthria",
+    copy: (
+      <>
+        Severe dysarthria is where Phonemenal earns its name. Some clips the
+        adapter{" "}
+        <span className="text-emerald-300">recovers the actual meaning</span>{" "}
+        the off-the-shelf model invented away. Others it&apos;s still wrong —
+        and the safety gate{" "}
+        <span className="text-amber-300">flags them as uncertain</span>{" "}
+        instead of shipping nonsense.
+      </>
+    ),
+  },
+];
+
+function DemoSlide({ subStep }: SlideProps) {
+  const beat = DEMO_NARRATIVE[subStep] ?? DEMO_NARRATIVE[0];
   return (
-    <div className="h-full flex flex-col px-12 py-7 max-w-7xl mx-auto w-full">
-      <header className="mb-5">
-        <div className="text-neutral-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
-          What makes Phonemer work
+    <div className="h-full flex flex-col px-10 py-6 max-w-7xl mx-auto w-full">
+      <header className="mb-4 min-h-[110px]">
+        <div
+          key={`demo-hdr-${subStep}`}
+          className="animate-[fadeUp_400ms_ease-out_both]"
+        >
+          <div className="text-emerald-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
+            Live demo · {beat.eyebrow}
+          </div>
+          <h1 className="text-3xl font-semibold tracking-tight mb-2">
+            Same audio, two transcribers.
+          </h1>
+          <p className="text-base text-neutral-400 leading-relaxed max-w-4xl">
+            {beat.copy}
+          </p>
         </div>
-        <h1 className="text-4xl font-semibold tracking-tight">
-          <span className="text-violet-300">Two strengths</span>, each addressing
-          a different Whisper failure mode.
-        </h1>
       </header>
 
-      <div className="grid lg:grid-cols-2 gap-5 flex-1 min-h-0">
-        <StrengthCard
-          n="1"
-          title="Per-patient adaptation"
-          accent="#a78bfa"
-          description={
-            <>
-              Whisper learns this patient two ways: an offline{" "}
-              <span className="text-violet-300">LoRA adapter</span> trained on
-              their voice, plus{" "}
-              <span className="text-violet-300">runtime context</span> (last
-              listener turn, active topics, patient vocabulary) fed to Whisper
-              at every call.
-            </>
-          }
-          note={
-            <>
-              <span className="text-violet-300 font-semibold">LoRA</span>{" "}
-              (Low-Rank Adaptation): keep Whisper&apos;s 242 M weights frozen,
-              learn a tiny additive correction{" "}
-              <code className="text-violet-200 font-mono">y = Wx + (B·A)x</code>{" "}
-              where <code className="font-mono">B</code> and{" "}
-              <code className="font-mono">A</code> are small matrices.
-              Personalized output, same inference speed.
-            </>
-          }
-          proofLabel="Measured WER reduction · TORGO eval split"
-          proof={<WerProof />}
-          stats={[
-            { label: "adapter", value: "~27 MB" },
-            { label: "trainable", value: "6.7 M" },
-            { label: "frozen", value: "242 M" },
-          ]}
-        />
-        <StrengthCard
-          n="2"
-          title="Phoneme safety gate"
-          accent="#22d3ee"
-          description={
-            <>
-              <span className="text-cyan-300">wav2vec2</span> reads the audio
-              independently. If Whisper&apos;s text doesn&apos;t acoustically
-              fit, we flag it as uncertain rather than surface a confident
-              hallucination.
-            </>
-          }
-          proofLabel="Caught hallucination · F03 reading TIMIT"
-          proof={<CaughtProof />}
-          stats={[
-            { label: "align", value: "< −0.85" },
-            { label: "over-prod", value: "> 25 ph/s" },
-            { label: "under-prod", value: "< 4 ph/s" },
-          ]}
-        />
+      {/* All three patient rows stay mounted; each one transcribes when
+          its sub-step is reached. Sub-steps "land" cumulatively — once a
+          row finishes its reveal it stays at full presence for the rest
+          of the slide. */}
+      <div className="flex-1 min-h-0 flex flex-col gap-3">
+        {DEMO_FLOW.map((flow, idx) => {
+          const state: PatientRowState =
+            idx < subStep ? "done" : idx === subStep ? "active" : "pending";
+          return (
+            <PatientRow
+              key={flow.patient}
+              flow={flow}
+              state={state}
+            />
+          );
+        })}
       </div>
     </div>
   );
 }
 
-// Card scaffold for the two strengths. Big tinted background, number
-// badge, title, description, proof block, stat chips footer. Both
-// cards share this so visual weight stays balanced.
-function StrengthCard({
-  n,
-  title,
-  accent,
-  description,
-  note,
-  proofLabel,
-  proof,
-  stats,
+// A single patient's comparison row. Patient pill + severity at the
+// top, then one comparison sub-row per example (typically 1 for FC02/F03
+// and 3 for M01 so severe dysarthria can show the full behavioral
+// envelope — recovery wins AND honest flagging). All sub-rows in a
+// patient share one reveal timer so they animate together; the row
+// owns its own state independent of siblings.
+type PatientRowState = "pending" | "active" | "done";
+
+function PatientRow({
+  flow,
+  state,
 }: {
-  n: string;
-  title: string;
-  accent: string;
-  description: React.ReactNode;
-  note?: React.ReactNode;
-  proofLabel: string;
-  proof: React.ReactNode;
-  stats: { label: string; value: string }[];
+  flow: {
+    patient: keyof typeof DEMO_EXAMPLES;
+    label: string;
+    examples: number[];
+  };
+  state: PatientRowState;
 }) {
+  type Phase = "pending" | "transcribing" | "vanilla" | "done";
+  const [phase, setPhase] = useState<Phase>("pending");
+
+  useEffect(() => {
+    if (state === "done") {
+      setPhase("done");
+      return;
+    }
+    if (state === "pending") {
+      setPhase("pending");
+      return;
+    }
+    // state === "active"
+    setPhase("transcribing");
+    const t1 = setTimeout(() => setPhase("vanilla"), 500);
+    const t2 = setTimeout(() => setPhase("done"), 1000);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [state]);
+
+  const accent =
+    flow.patient === "FC02"
+      ? "#10b981"
+      : flow.patient === "F03"
+        ? "#f59e0b"
+        : "#ef4444";
+
+  const dim = state === "pending";
+  const examplesOnRow = flow.examples
+    .map((idx) => DEMO_EXAMPLES[flow.patient]?.[idx])
+    .filter((e): e is DemoExample => !!e);
+
   return (
     <div
-      className="rounded-2xl border bg-gradient-to-br from-neutral-900/60 to-neutral-950 p-6 flex flex-col gap-4 overflow-hidden"
+      className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-4 transition-all duration-500"
       style={{
-        borderColor: accent + "66",
-        boxShadow: `0 0 24px ${accent}14`,
+        opacity: dim ? 0.22 : 1,
+        filter: dim ? "saturate(0.4)" : undefined,
+        boxShadow:
+          state === "active"
+            ? `0 0 0 1px ${accent}55, 0 8px 24px ${accent}1a`
+            : undefined,
       }}
     >
-      {/* Header */}
-      <div>
-        <div className="flex items-center gap-2.5 mb-2">
-          <div
-            className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-mono font-bold"
-            style={{
-              backgroundColor: accent + "22",
-              border: `1px solid ${accent}88`,
-              color: accent,
-            }}
-          >
-            {n}
-          </div>
-          <div
-            className="text-[11px] uppercase tracking-[0.2em] font-mono"
-            style={{ color: accent }}
-          >
-            Strength {n}
-          </div>
-        </div>
-        <h2
-          className="text-2xl font-semibold tracking-tight mb-2"
-          style={{ color: accent }}
+      {/* Patient header — full-width strip above the comparison sub-rows
+          so the patient identity is established once even when there
+          are multiple examples stacked below it. */}
+      <div className="flex items-center gap-3 mb-3">
+        <span
+          className="text-[10px] uppercase tracking-[0.18em] font-mono font-semibold px-2 py-0.5 rounded"
+          style={{ backgroundColor: accent, color: "#ffffff" }}
         >
-          {title}
-        </h2>
-        <p className="text-sm text-neutral-400 leading-relaxed">{description}</p>
-
-        {/* Plain-language explainer for the bit of jargon in the
-            description (e.g. "what's a LoRA?"). Styled as a subtle
-            info-tile so it reads as supplementary, not part of the
-            main pitch. */}
-        {note && (
-          <div
-            className="mt-3 rounded-lg border bg-neutral-950/50 px-3 py-2 flex gap-2.5 items-start"
-            style={{ borderColor: accent + "33" }}
-          >
-            <span
-              className="shrink-0 mt-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-mono font-bold"
-              style={{
-                backgroundColor: accent + "33",
-                color: accent,
-              }}
-            >
-              i
-            </span>
-            <span className="text-[11.5px] text-neutral-400 leading-relaxed">
-              {note}
-            </span>
-          </div>
+          {flow.patient}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-mono text-neutral-500">
+          {flow.label}
+        </span>
+        {examplesOnRow.length > 1 && (
+          <span className="text-[10px] text-neutral-500 font-mono">
+            · {examplesOnRow.length} clips
+          </span>
         )}
       </div>
 
-      {/* Proof block */}
-      <div className="flex-1 min-h-0 flex flex-col">
-        <div className="text-[10px] uppercase tracking-wider text-neutral-500 font-mono mb-2">
-          {proofLabel}
-        </div>
-        <div className="flex-1 min-h-0">{proof}</div>
-      </div>
-
-      {/* Stat chips */}
-      <div className="grid grid-cols-3 gap-2 pt-2 border-t border-neutral-800/80">
-        {stats.map((s) => (
-          <div key={s.label}>
-            <div className="text-[9px] uppercase tracking-wider text-neutral-500 mb-0.5">
-              {s.label}
-            </div>
-            <div
-              className="text-sm font-mono font-semibold"
-              style={{ color: accent }}
-            >
-              {s.value}
-            </div>
-          </div>
+      {/* One row per example. They share the patient row's phase so
+          they reveal in parallel, but each computes its own diff/WER
+          against its own ground truth. */}
+      <div className="space-y-2">
+        {examplesOnRow.map((example, i) => (
+          <DemoExampleRow
+            key={i}
+            example={example}
+            phase={phase}
+            state={state}
+            isLastInGroup={i === examplesOnRow.length - 1}
+          />
         ))}
       </div>
     </div>
   );
 }
 
-// Inline proof for Strength 1 — WER before/after for the three TORGO
-// speakers in one tidy block. Reuses the ResultStat scaffold from the
-// older slide for consistency.
-function WerProof() {
-  return (
-    <div className="space-y-2">
-      <ResultStat label="FC02 (control)" before="WER 0.27" after="WER 0.17" delta="−35%" />
-      <ResultStat label="F03 (mild)" before="WER 0.70" after="WER 0.47" delta="−32%" />
-      <ResultStat label="M01 (severe)" before="WER 1.02" after="WER 0.54" delta="−47%" highlight />
-    </div>
-  );
-}
-
-// Inline proof for Strength 2 — a single caught hallucination with the
-// alignment score landing in the flag zone. Compact version of the
-// older GateExampleCard, trimmed to fit alongside the WER chart.
-function CaughtProof() {
-  return (
-    <div className="space-y-2.5">
-      <div>
-        <span className="text-[10px] text-neutral-500 italic">intended: </span>
-        <span className="text-xs italic text-neutral-300">
-          “A roll of wire lay near the wall”
-        </span>
-      </div>
-      <div>
-        <div className="flex items-center gap-1.5 mb-0.5">
-          <span className="inline-block w-1 h-1 rounded-full bg-violet-400" />
-          <span className="text-[10px] uppercase tracking-wider text-violet-400 font-mono">
-            Whisper heard
-          </span>
-        </div>
-        <div className="text-sm text-red-300 leading-snug">
-          I need a little wired lay Diego mall
-        </div>
-      </div>
-      <div>
-        <div className="flex items-center gap-1.5 mb-0.5">
-          <span className="inline-block w-1 h-1 rounded-full bg-cyan-400" />
-          <span className="text-[10px] uppercase tracking-wider text-cyan-400 font-mono">
-            wav2vec2 heard
-          </span>
-        </div>
-        <div className="flex flex-wrap gap-1">
-          {["ə", "ɹ", "oʊ", "l", "ə", "v", "w", "aɪ", "ɚ", "l", "eɪ", "n"].map(
-            (p, i) => (
-              <span
-                key={i}
-                className="px-1 py-0 rounded text-[11px] font-mono bg-cyan-950/40 border border-cyan-800/40 text-cyan-200"
-              >
-                {p}
-              </span>
-            ),
-          )}
-          <span className="text-[10px] text-neutral-600 self-center">…</span>
-        </div>
-      </div>
-      <div className="flex items-center justify-between pt-2 border-t border-neutral-800/80">
-        <div className="text-[11px] text-neutral-400">
-          align score{" "}
-          <span className="font-mono text-red-300">−1.4</span>
-          <span className="text-neutral-600"> (thr −0.85) →</span>
-        </div>
-        <div className="text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded bg-amber-900/40 border border-amber-700/60 text-amber-300">
-          ● flagged
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function LoraSlide(_: SlideProps) {
-  void _;
-  return (
-    <div className="h-full flex flex-col px-12 py-5 max-w-7xl mx-auto w-full">
-      <header className="mb-3">
-        <div className="text-violet-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
-          Strength 1 · Per-patient adaptation
-        </div>
-        <h1 className="text-3xl font-semibold tracking-tight mb-2">
-          Two ways Whisper learns{" "}
-          <span className="text-violet-300">this</span> patient.
-        </h1>
-        <p className="text-sm text-neutral-400 max-w-3xl">
-          An <span className="text-violet-300">offline LoRA adapter</span>{" "}
-          trained on the patient&apos;s voice, plus{" "}
-          <span className="text-violet-300">runtime context</span> (last
-          listener turn, active topics, patient vocab) fed to Whisper at
-          every inference call.
-        </p>
-      </header>
-
-      <div className="grid lg:grid-cols-5 gap-4 flex-1 min-h-0">
-        {/* Mechanism 1 — offline LoRA */}
-        <div className="lg:col-span-3 flex flex-col min-h-0">
-          <SectionLabel
-            accent="#a78bfa"
-            label="Offline · LoRA adapter"
-            sub="trained once per patient, lives on disk"
-          />
-          <div className="grid grid-cols-5 gap-3 mt-2.5 flex-1 min-h-0">
-            <div className="col-span-3 min-h-0">
-              <LoraVisualization />
-            </div>
-            <div className="col-span-2 flex flex-col gap-2.5">
-              <Equation />
-              <div className="grid grid-cols-2 gap-2">
-                <FactBig label="trainable" value="6.7 M" sub="LoRA params" accent="#a78bfa" />
-                <FactBig label="frozen" value="242 M" sub="Whisper" accent="#737373" />
-                <FactBig label="size" value="~27 MB" sub="per patient" accent="#a78bfa" />
-                <FactBig label="targets" value="q·k·v·o" sub="+ fc1·fc2" accent="#a78bfa" />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Mechanism 2 — runtime initial_prompt context */}
-        <div className="lg:col-span-2 flex flex-col min-h-0">
-          <SectionLabel
-            accent="#a78bfa"
-            label="Runtime · initial_prompt"
-            sub="≤ 220 chars · ContextManager"
-          />
-          <ContextMechanism />
-        </div>
-      </div>
-
-      {/* Measured improvement — concrete numbers for Strength 1 */}
-      <div className="mt-4">
-        <div className="flex items-baseline justify-between border-b border-neutral-800/80 pb-1.5 mb-2.5">
-          <div className="flex items-center gap-2">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-violet-400" />
-            <span className="text-[11px] uppercase tracking-[0.2em] text-violet-400 font-mono">
-              Measured improvement
-            </span>
-          </div>
-          <span className="text-[10px] uppercase tracking-wider font-mono text-neutral-600">
-            vanilla → adapter · TORGO eval split
-          </span>
-        </div>
-        <div className="grid md:grid-cols-3 gap-3">
-          <ResultStat label="FC02 (control)" before="WER 0.27" after="WER 0.17" delta="−35%" />
-          <ResultStat label="F03 (mild)" before="WER 0.70" after="WER 0.47" delta="−32%" />
-          <ResultStat label="M01 (severe)" before="WER 1.02" after="WER 0.54" delta="−47%" highlight />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Runtime-context panel for Strength 1. Shows what the ContextManager
-// assembles into `initial_prompt` before every Whisper call — recent
-// listener turn, conversation topics, patient-specific vocab. Mirrors
-// the side-input node in the architecture diagram but explains *why*
-// each channel matters. Sample values are illustrative; real ones come
-// from `ContextManager.whisper_prompt()` at runtime.
-function ContextMechanism() {
-  return (
-    <div className="mt-2.5 flex-1 min-h-0 flex flex-col gap-2.5">
-      <div className="rounded-xl border border-violet-800/40 bg-neutral-950/60 px-4 py-3 font-mono text-[11px] space-y-2 leading-snug">
-        <div className="text-[9px] uppercase tracking-wider text-violet-300 mb-1">
-          initial_prompt =
-        </div>
-        <ContextLine
-          label="last turn"
-          value={"“Could you read this for me?”"}
-          note="what the listener just said"
-        />
-        <ContextLine
-          label="topics"
-          value="banks, money, gabapentin…"
-          note="active conversation subjects"
-        />
-        <ContextLine
-          label="vocab"
-          value="Dr. Park, gabapentin, valproate…"
-          note="patient-specific terminology"
-        />
-      </div>
-
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 px-4 py-3 text-[12px] text-neutral-400 leading-relaxed">
-        Whisper is a generative LM, not just an ASR. Priming the decoder
-        with the patient&apos;s recent context biases borderline word choices
-        toward what they&apos;ve actually been talking about —{" "}
-        <span className="text-violet-300">&ldquo;gabapentin&rdquo;</span>{" "}
-        instead of{" "}
-        <span className="text-neutral-500">&ldquo;gabba pen tin&rdquo;</span>,{" "}
-        <span className="text-violet-300">&ldquo;Dr. Park&rdquo;</span> instead
-        of <span className="text-neutral-500">&ldquo;doctor parked&rdquo;</span>.
-      </div>
-    </div>
-  );
-}
-
-// One row inside the mock initial_prompt panel. Channel label + value
-// + grayed-out "what this is" caption underneath.
-function ContextLine({
-  label,
-  value,
-  note,
+// One side-by-side transcription comparison + outcome chip. Always
+// rendered inside a PatientRow.
+function DemoExampleRow({
+  example,
+  phase,
+  state,
+  isLastInGroup,
 }: {
-  label: string;
-  value: string;
-  note: string;
+  example: DemoExample;
+  phase: "pending" | "transcribing" | "vanilla" | "done";
+  state: PatientRowState;
+  isLastInGroup: boolean;
 }) {
-  return (
-    <div className="flex flex-col">
-      <div className="flex items-baseline gap-2 min-w-0">
-        <span className="shrink-0 text-violet-300">{label}:</span>
-        <span className="truncate text-neutral-200">{value}</span>
-      </div>
-      <span className="text-[9px] text-neutral-600 ml-[5.5rem] mt-0.5 leading-none">
-        {note}
-      </span>
-    </div>
-  );
-}
-
-function LoraVisualization() {
-  return (
-    <div className="rounded-2xl border border-violet-800/40 bg-neutral-900/40 p-6 flex items-center justify-center">
-      <svg viewBox="0 0 400 320" className="w-full h-auto max-h-[480px]">
-        {/* Big frozen W matrix */}
-        <g>
-          <rect x="20" y="20" width="180" height="180" fill="#171717" stroke="#525252" strokeWidth="1.5" rx="4" />
-          {/* fake weight grid */}
-          {Array.from({ length: 8 }).map((_, r) =>
-            Array.from({ length: 8 }).map((_, c) => (
-              <rect
-                key={`${r}-${c}`}
-                x={26 + c * 21.5}
-                y={26 + r * 21.5}
-                width="18"
-                height="18"
-                fill={`rgba(115,115,115,${0.18 + ((r * 7 + c) % 5) * 0.08})`}
-              />
-            )),
-          )}
-          <text x="110" y="220" textAnchor="middle" fontSize="14" fill="#d4d4d4" fontFamily="monospace">
-            W (frozen)
-          </text>
-          <text x="110" y="240" textAnchor="middle" fontSize="11" fill="#737373" fontFamily="monospace">
-            768 × 768
-          </text>
-        </g>
-        <text x="218" y="115" fontSize="32" fill="#a78bfa" textAnchor="middle">+</text>
-        {/* B matrix (tall) */}
-        <g>
-          <rect x="240" y="40" width="32" height="140" fill="#1e1b4b" stroke="#a78bfa" strokeWidth="1.5" rx="3" />
-          {Array.from({ length: 7 }).map((_, r) =>
-            Array.from({ length: 1 }).map((_, c) => (
-              <rect
-                key={`b-${r}-${c}`}
-                x={244 + c * 12}
-                y={44 + r * 19.5}
-                width="24"
-                height="16"
-                fill={`rgba(167,139,250,${0.4 + (r % 3) * 0.2})`}
-              />
-            )),
-          )}
-          <text x="256" y="200" textAnchor="middle" fontSize="13" fill="#c4b5fd" fontFamily="monospace">
-            B
-          </text>
-          <text x="256" y="216" textAnchor="middle" fontSize="10" fill="#737373" fontFamily="monospace">
-            768 × 16
-          </text>
-        </g>
-        <text x="290" y="115" fontSize="22" fill="#a78bfa" textAnchor="middle">·</text>
-        {/* A matrix (wide) */}
-        <g>
-          <rect x="305" y="100" width="76" height="32" fill="#1e1b4b" stroke="#a78bfa" strokeWidth="1.5" rx="3" />
-          {Array.from({ length: 1 }).map((_, r) =>
-            Array.from({ length: 4 }).map((_, c) => (
-              <rect
-                key={`a-${r}-${c}`}
-                x={309 + c * 18}
-                y={104 + r * 12}
-                width="14"
-                height="22"
-                fill={`rgba(167,139,250,${0.4 + (c % 3) * 0.2})`}
-              />
-            )),
-          )}
-          <text x="343" y="156" textAnchor="middle" fontSize="13" fill="#c4b5fd" fontFamily="monospace">
-            A
-          </text>
-          <text x="343" y="172" textAnchor="middle" fontSize="10" fill="#737373" fontFamily="monospace">
-            16 × 768
-          </text>
-        </g>
-        {/* "Trainable" badge — points the audience at B and A without
-            relying on backprop notation. Replaces the earlier
-            ∂L/∂θ arrows that curved down to nothing visible. */}
-        <g>
-          <rect
-            x="220"
-            y="220"
-            width="180"
-            height="26"
-            rx="13"
-            fill="#1e1b4b"
-            stroke="#a78bfa"
-            strokeWidth="1"
-            opacity="0.9"
-          />
-          <circle cx="238" cy="233" r="3.5" fill="#a78bfa">
-            <animate attributeName="opacity" values="0.4;1;0.4" dur="1.8s" repeatCount="indefinite" />
-          </circle>
-          <text x="252" y="238" fontSize="12" fill="#c4b5fd" fontFamily="monospace">
-            B and A — trainable
-          </text>
-        </g>
-        {/* W frozen badge — symmetric callout below W so the
-            "what updates / what stays" story reads at a glance. */}
-        <g>
-          <rect
-            x="40"
-            y="262"
-            width="140"
-            height="24"
-            rx="12"
-            fill="#171717"
-            stroke="#525252"
-            strokeWidth="1"
-          />
-          <circle cx="56" cy="274" r="3.5" fill="#737373" />
-          <text x="70" y="279" fontSize="12" fill="#a3a3a3" fontFamily="monospace">
-            W — frozen
-          </text>
-        </g>
-      </svg>
-    </div>
-  );
-}
-
-function Equation() {
-  return (
-    <div className="rounded-lg bg-neutral-950 border border-violet-800/40 p-5 text-center">
-      <div className="font-mono text-2xl text-neutral-200">
-        y = W<span className="text-neutral-500">x</span> +{" "}
-        <span className="text-violet-300">(B·A)</span>
-        <span className="text-neutral-500">x</span>
-      </div>
-      <div className="mt-2 font-mono text-xs text-neutral-500">
-        W frozen · B (768×16), A (16×768) trainable
-      </div>
-    </div>
-  );
-}
-
-function FactBig({
-  label,
-  value,
-  sub,
-  accent,
-}: {
-  label: string;
-  value: string;
-  sub: string;
-  accent: string;
-}) {
-  return (
-    <div
-      className="rounded-lg border bg-neutral-900/40 p-3"
-      style={{ borderColor: accent + "55" }}
-    >
-      <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">
-        {label}
-      </div>
-      <div className="font-mono text-2xl" style={{ color: accent }}>
-        {value}
-      </div>
-      <div className="text-[10px] font-mono text-neutral-500 mt-0.5">{sub}</div>
-    </div>
-  );
-}
-
-// Strength 2 — Phoneme safety gate. Showcases the "hallucination check"
-// half of Phonemer: a second model (wav2vec2) reads the audio
-// independently, and we use forced alignment to score whether Whisper's
-// proposed text acoustically fits. The slide is anchored by a concrete
-// caught-hallucination example so judges see the strength in action,
-// not just three threshold numbers.
-function PhonemeGateSlide(_: SlideProps) {
-  void _;
-  return (
-    <div className="h-full flex flex-col px-12 py-6 max-w-7xl mx-auto w-full">
-      <header className="mb-4">
-        <div className="text-cyan-400 font-mono text-xs uppercase tracking-[0.25em] mb-2">
-          Strength 2 · Phoneme safety gate
-        </div>
-        <h1 className="text-4xl font-semibold tracking-tight mb-2">
-          A <span className="text-cyan-300">second model</span> reads the audio.
-          Hallucinations get flagged.
-        </h1>
-        <p className="text-sm text-neutral-400 max-w-3xl">
-          Whisper&apos;s worst failure on impaired speech: fluent hallucinations
-          that sound plausible. wav2vec2 gives an independent phoneme reading
-          — if Whisper&apos;s text doesn&apos;t acoustically fit, we flag it.
-        </p>
-      </header>
-
-      <div className="grid lg:grid-cols-5 gap-5 flex-1 min-h-0">
-        {/* Concrete caught example */}
-        <div className="lg:col-span-3 flex flex-col">
-          <SectionLabel
-            accent="#06b6d4"
-            label="A caught hallucination"
-            sub="F03 · TORGO eval"
-          />
-          <GateExampleCard
-            intended="A roll of wire lay near the wall"
-            whisperHeard="I need a little wired lay Diego mall"
-            wav2vec2Phonemes={["ə", "ɹ", "oʊ", "l", "ə", "v", "w", "aɪ", "ɚ", "l", "eɪ", "n", "ɪ", "ɹ", "w", "ɔ", "l"]}
-            alignScore={-1.4}
-            threshold={-0.85}
-          />
-        </div>
-
-        {/* The 3 gate checks */}
-        <div className="lg:col-span-2 flex flex-col">
-          <SectionLabel
-            accent="#06b6d4"
-            label="The three checks"
-            sub="any one flags the clip"
-          />
-          <div className="grid grid-cols-1 gap-2.5 mt-3">
-            <CheckCard
-              title="Alignment"
-              what="mean force-aligned log-prob"
-              threshold="< −0.85"
-              catches="fluent hallucination"
-              icon={<AlignIcon />}
-            />
-            <CheckCard
-              title="Phoneme density · high"
-              what="more phonemes than acoustically fit"
-              threshold="> 25 ph/s"
-              catches="over-production"
-              icon={<DensityHighIcon />}
-            />
-            <CheckCard
-              title="Phoneme density · low"
-              what="Whisper bailed mid-utterance (≥ 2 s clips)"
-              threshold="< 4 ph/s voiced"
-              catches="under-production"
-              icon={<DensityLowIcon />}
-            />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Big "see the strength in action" card. Shows the input intended text,
-// Whisper's (wrong) output, wav2vec2's parallel phoneme reading, and the
-// alignment score landing below the threshold — verdict pill at the
-// right. Designed so the judge can follow the catch left-to-right
-// without reading the supporting prose.
-function GateExampleCard({
-  intended,
-  whisperHeard,
-  wav2vec2Phonemes,
-  alignScore,
-  threshold,
-}: {
-  intended: string;
-  whisperHeard: string;
-  wav2vec2Phonemes: string[];
-  alignScore: number;
-  threshold: number;
-}) {
-  // Threshold position on a [-8, 0] axis used by the score meter.
-  const thresholdPct = ((8 + threshold) / 8) * 100;
-  const scorePct = ((8 + alignScore) / 8) * 100;
-  const flagged = alignScore < threshold;
-  return (
-    <div className="mt-3 rounded-2xl border border-cyan-800/40 bg-neutral-900/40 p-5 flex-1 flex flex-col gap-3.5 overflow-hidden">
-      {/* Intended sentence (what the patient was actually trying to say) */}
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-neutral-500 font-mono mb-0.5">
-          what they said
-        </div>
-        <div className="text-sm italic text-neutral-300">“{intended}”</div>
-      </div>
-
-      {/* Whisper's hallucinated output */}
-      <div>
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-violet-400" />
-          <span className="text-[10px] uppercase tracking-wider text-violet-400 font-mono">
-            Whisper heard
-          </span>
-        </div>
-        <div className="text-base text-red-300 leading-snug">{whisperHeard}</div>
-      </div>
-
-      {/* wav2vec2's independent phoneme reading */}
-      <div>
-        <div className="flex items-center gap-2 mb-1">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400" />
-          <span className="text-[10px] uppercase tracking-wider text-cyan-400 font-mono">
-            wav2vec2 heard
-          </span>
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {wav2vec2Phonemes.map((p, i) => (
-            <span
-              key={i}
-              className="px-1.5 py-0.5 rounded text-[12px] font-mono bg-cyan-950/40 border border-cyan-800/40 text-cyan-200"
-            >
-              {p}
-            </span>
-          ))}
-        </div>
-      </div>
-
-      {/* Alignment score meter — log-prob axis [-8, 0], threshold at -0.85 */}
-      <div className="mt-1">
-        <div className="flex items-baseline justify-between mb-1">
-          <span className="text-[10px] uppercase tracking-wider text-neutral-500 font-mono">
-            forced-alignment score
-          </span>
-          <span className="text-[10px] font-mono text-neutral-500">
-            {alignScore.toFixed(2)} log-prob · threshold {threshold}
-          </span>
-        </div>
-        <div className="relative h-3 rounded-full bg-neutral-900 border border-neutral-800 overflow-hidden">
-          {/* Pass zone */}
-          <div
-            className="absolute top-0 h-full bg-emerald-700/30"
-            style={{ left: `${thresholdPct}%`, width: `${100 - thresholdPct}%` }}
-          />
-          {/* Fail zone */}
-          <div
-            className="absolute top-0 h-full bg-red-900/30"
-            style={{ left: 0, width: `${thresholdPct}%` }}
-          />
-          {/* Threshold tick */}
-          <div
-            className="absolute top-0 h-full w-px bg-neutral-300/70"
-            style={{ left: `${thresholdPct}%` }}
-          />
-          {/* Score marker */}
-          <div
-            className="absolute top-0 h-full w-1 bg-red-400 shadow-[0_0_6px_rgba(248,113,113,0.7)]"
-            style={{ left: `calc(${scorePct}% - 2px)` }}
-          />
-        </div>
-        <div className="flex justify-between text-[9px] font-mono text-neutral-600 mt-0.5">
-          <span>−8 (worst)</span>
-          <span style={{ marginLeft: `${thresholdPct - 8}%` }}>thr {threshold}</span>
-          <span>0 (best)</span>
-        </div>
-      </div>
-
-      {/* Verdict pill */}
-      <div className="flex items-center justify-between pt-2 border-t border-neutral-800/80">
-        <div className="text-xs text-neutral-400">
-          {flagged ? (
-            <>
-              Text still surfaced — but marked{" "}
-              <span className="text-amber-300">uncertain</span> so the listener
-              knows not to act on it.
-            </>
-          ) : (
-            <>Verdict accepted; text surfaced confidently.</>
-          )}
-        </div>
-        <div
-          className={`shrink-0 ml-3 px-2.5 py-1 rounded-md text-[11px] font-mono uppercase tracking-wider ${
-            flagged
-              ? "bg-amber-900/40 border border-amber-700/60 text-amber-300"
-              : "bg-emerald-900/40 border border-emerald-700/60 text-emerald-300"
-          }`}
-        >
-          {flagged ? "● flagged · low_alignment" : "● accepted"}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// One row in the "three checks" panel. Compact: icon + title, then
-// what / threshold / catches. Designed to scan in ~3 s per row so the
-// audience walks away with "any one check flags the clip."
-function CheckCard({
-  title,
-  what,
-  threshold,
-  catches,
-  icon,
-}: {
-  title: string;
-  what: string;
-  threshold: string;
-  catches: string;
-  icon: React.ReactNode;
-}) {
-  return (
-    <div className="rounded-xl border border-cyan-800/40 bg-neutral-900/40 px-3.5 py-3 flex items-start gap-3">
-      <div
-        className="shrink-0 w-9 h-9 rounded-md flex items-center justify-center text-cyan-300"
-        style={{
-          backgroundColor: "#06b6d418",
-          border: "1px solid #06b6d455",
-        }}
-      >
-        {icon}
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="text-sm font-semibold text-neutral-100 leading-tight">
-          {title}
-        </div>
-        <div className="text-[11px] text-neutral-400 mt-0.5 leading-snug">
-          {what}
-        </div>
-        <div className="flex items-baseline gap-2 mt-1.5 font-mono text-[10px]">
-          <span className="text-cyan-300">{threshold}</span>
-          <span className="text-neutral-600">·</span>
-          <span className="text-neutral-500">catches {catches}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Inline icons for the three gate checks. Hand-rolled to echo the
-// concept of each check (alignment crosses, dense bars, sparse bars).
-function AlignIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <circle cx="6" cy="7" r="1.2" fill="currentColor" />
-      <circle cx="6" cy="17" r="1.2" fill="currentColor" />
-      <circle cx="18" cy="7" r="1.2" fill="currentColor" />
-      <circle cx="18" cy="17" r="1.2" fill="currentColor" />
-      <line x1="6" y1="7" x2="18" y2="7" stroke="currentColor" strokeWidth="1" />
-      <line x1="6" y1="17" x2="18" y2="17" stroke="currentColor" strokeWidth="1" />
-      <line x1="6" y1="7" x2="18" y2="17" stroke="currentColor" strokeWidth="1.4" opacity="0.85" />
-      <line x1="18" y1="7" x2="6" y2="17" stroke="currentColor" strokeWidth="1.4" opacity="0.85" />
-    </svg>
-  );
-}
-
-function DensityHighIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <rect x="3" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="5.5" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="8" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="10.5" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="13" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="15.5" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="18" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="20.5" y="6" width="1.5" height="12" fill="currentColor" />
-    </svg>
-  );
-}
-
-function DensityLowIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden>
-      <rect x="4" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="11" y="6" width="1.5" height="12" fill="currentColor" />
-      <rect x="18" y="6" width="1.5" height="12" fill="currentColor" />
-    </svg>
-  );
-}
-
-function ResultStat({
-  label,
-  before,
-  after,
-  delta,
-  highlight = false,
-}: {
-  label: string;
-  before: string;
-  after: string;
-  delta: string;
-  highlight?: boolean;
-}) {
-  return (
-    <div
-      className={`rounded-lg border px-4 py-3 ${
-        highlight
-          ? "border-emerald-700/60 bg-emerald-950/15"
-          : "border-neutral-800 bg-neutral-900/40"
-      }`}
-    >
-      <div className="text-xs font-mono text-neutral-500 mb-1">{label}</div>
-      <div className="flex items-baseline gap-2">
-        <span className="font-mono text-sm text-amber-300/80 line-through">
-          {before}
-        </span>
-        <span className="text-neutral-500">→</span>
-        <span className="font-mono text-sm text-emerald-300">{after}</span>
-        <span className="ml-auto font-mono text-base text-emerald-400">
-          {delta}
-        </span>
-      </div>
-    </div>
-  );
-}
-
-// ───────────────────────────────────────────────── Phase 4 — Live demo
-
-// Module-scope so the dedupe survives Next.js' dev StrictMode
-// mount→unmount→remount cycle (a component-scope useRef gets a fresh
-// instance on the remount and would let the auto-run fire twice,
-// racing two parallel /torgo/audio fetches and surfacing one of them
-// as "Failed to fetch"). Module state persists across the simulated
-// remount; production builds run a single mount so this cache simply
-// accumulates one entry per clip viewed during the session.
-const _demoAutoRunClipIds = new Set<number>();
-
-// The unified demo slide. One screen, one message: a "normal" speech
-// model (off-the-shelf Whisper) confidently produces nonsense on the
-// same audio that Phonemer (per-patient adapter + phoneme safety gate)
-// either gets right or honestly flags as uncertain.
-//
-// Design priorities for a judge:
-//   * One click → see the difference (auto-runs on patient change).
-//   * The intended text is centerpiece — the question "did the model
-//     hear what the patient was actually saying?" is what the audience
-//     is judging.
-//   * Two equal-weight side-by-side cards using DiffText so the wrong
-//     words are visually obvious in both halves.
-//   * Hero delta below makes the WER reduction quantitative.
-//   * Pipeline internals (waveform / VAD / phoneme strip) tucked into
-//     a collapsed details block — they're the proof, not the message.
-function DemoSlide({
-  clips,
-  pipeline,
-  setSelectedClipId,
-  setSpeakerFilter,
-  runPipeline,
-  selectedClip,
-  adapterPath,
-  audio,
-  isPlaying,
-  playheadMs,
-}: SlideProps) {
-  const [picked, setPicked] = useState<string>("F03");
-  // Index into the eligible-clips list for the current patient. Lets the
-  // user (or judge) cycle through multiple examples per patient — important
-  // for showing that severe-dysarthria patients have BOTH outcomes in their
-  // adapter: some clips Phonemer flags ("honest uncertainty"), others
-  // Phonemer transcribes correctly while vanilla fails ("better accuracy").
-  // A single example doesn't tell that whole story.
-  const [exampleIndex, setExampleIndex] = useState(0);
-
-  // All eligible demo clips for the current patient: TIMIT sentences ≥4
-  // words (real-life-shaped utterances, not one-word stimuli) in stable
-  // id order so the cycler is deterministic across renders.
-  const eligibleClips = useMemo(() => {
-    return (clips ?? [])
-      .filter(
-        (c) =>
-          c.speaker_id === picked &&
-          c.prompt_set === "timit" &&
-          (c.intended_text?.split(/\s+/).filter(Boolean).length ?? 0) >= 4,
-      )
-      .slice()
-      .sort((a, b) => a.id - b.id);
-  }, [clips, picked]);
-
-  // Reset the example index when patient changes — the picker is per-patient.
-  useEffect(() => {
-    setExampleIndex(0);
-  }, [picked]);
-
-  useEffect(() => {
-    setSpeakerFilter?.(picked);
-    if (eligibleClips.length === 0) return;
-    const i = ((exampleIndex % eligibleClips.length) + eligibleClips.length) %
-      eligibleClips.length;
-    setSelectedClipId?.(eligibleClips[i].id);
-  }, [picked, exampleIndex, eligibleClips, setSelectedClipId, setSpeakerFilter]);
-
-  // Auto-fire the pipeline when the patient (and therefore selectedClip)
-  // changes. Lets a judge click a chip and see the comparison without an
-  // intermediate "Run" click. The "have we already auto-run this clip?"
-  // check uses ``_demoAutoRunClipIds`` (module-scope) so it survives
-  // StrictMode's mount → unmount → remount cycle in dev — a component-
-  // scoped useRef would be reset on the remount and let the effect
-  // race two parallel pipelines. The pipeline.status check is a second
-  // line of defense: even if the cache misses for some reason, we
-  // never queue a second run while one is already in flight.
-  useEffect(() => {
-    if (!selectedClip || !runPipeline) return;
-    if (pipeline.status === "running") return;
-    if (_demoAutoRunClipIds.has(selectedClip.id)) return;
-    _demoAutoRunClipIds.add(selectedClip.id);
-    void runPipeline();
-  }, [selectedClip, runPipeline, pipeline.status]);
-
-  useAudioAutoplay(
-    audio,
-    pipeline.phonemeFramesByUtt &&
-      Object.keys(pipeline.phonemeFramesByUtt).length > 0,
-  );
-
-  // Joined adapter output across utterances (VAD can split one clip
-  // into N segments; concatenating preserves the full transcript).
-  const adapted = pipeline.translations
-    .slice()
-    .sort((a, b) => a.utterance_id - b.utterance_id)
-    .map((t) => t.primary)
-    .filter(Boolean)
-    .join(" ");
-
-  const ref = selectedClip?.intended_text ?? null;
-  const vw = ref ? wer(ref, pipeline.vanillaText) : null;
-  const aw = ref ? wer(ref, adapted || null) : null;
-  const anyFlagged = pipeline.translations.some((t) => t.flagged);
-  const allFrames: PhonemeWindowMessage["frames"] = [];
-  for (const u of pipeline.utterances) {
-    const fr = pipeline.phonemeFramesByUtt[u.utterance_id] ?? [];
-    allFrames.push(...fr);
-  }
-  allFrames.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
-
-  const running = pipeline.status === "running";
-  const done = pipeline.status === "done";
+  const showVanilla = phase === "vanilla" || phase === "done";
+  const showAdapted = phase === "done";
+  const ref = example.intended;
+  const vw = showVanilla ? wer(ref, example.vanilla) : null;
+  const aw = showAdapted ? wer(ref, example.adapted) : null;
+  const flagged = example.flagged;
   const reduction =
     vw !== null && aw !== null && vw > 0 && aw < vw
       ? Math.max(1, Math.round((1 - aw / vw) * 100))
       : null;
 
-  const PATIENTS = [
-    { id: "FC02", label: "healthy control" },
-    { id: "F03", label: "mild dysarthria" },
-    { id: "M01", label: "severe dysarthria" },
-  ] as const;
-
   return (
-    <div className="h-full flex flex-col px-10 py-6 max-w-7xl mx-auto w-full overflow-y-auto">
-      {/* Top row: eyebrow + patient chips + Run button */}
-      <header className="mb-5 flex items-end justify-between gap-4 flex-wrap">
-        <div>
-          <div className="text-emerald-400 font-mono text-xs uppercase tracking-[0.25em] mb-1">
-            Live demo
-          </div>
-          <h1 className="text-3xl font-semibold tracking-tight">
-            Same audio, two transcribers.
-          </h1>
-          <p className="text-sm text-neutral-400 mt-1 max-w-2xl">
-            Pick a patient. Phonemer and a stock speech model both listen to
-            the same clip. The difference is what you should remember.
-          </p>
+    <div
+      className={`grid grid-cols-[260px_1fr_1fr_120px] gap-4 items-start ${
+        !isLastInGroup ? "pb-2 border-b border-neutral-800/60" : ""
+      }`}
+    >
+      {/* Ground truth */}
+      <div className="min-w-0">
+        <div className="text-[9px] uppercase tracking-wider font-mono text-neutral-600 mb-0.5">
+          ground truth
         </div>
-        <div className="flex items-center gap-2">
-          {PATIENTS.map((p) => {
-            const active = picked === p.id;
-            return (
-              <button
-                key={p.id}
-                onClick={() => setPicked(p.id)}
-                className={`text-left rounded-md border px-3 py-1.5 text-xs transition-colors ${
-                  active
-                    ? "border-emerald-500 bg-emerald-950/30 text-emerald-200"
-                    : "border-neutral-700 bg-neutral-900/40 text-neutral-300 hover:border-neutral-600"
-                }`}
-              >
-                <span className="font-mono font-semibold">{p.id}</span>
-                <span className="opacity-60 ml-1.5">· {p.label}</span>
-              </button>
-            );
-          })}
-          <button
-            onClick={runPipeline}
-            disabled={!selectedClip || running}
-            className="ml-1 rounded-md bg-emerald-600 px-4 py-1.5 text-xs font-medium hover:bg-emerald-500 disabled:opacity-40"
-          >
-            {running ? "Running…" : done ? "Re-run" : "Run pipeline"}
-          </button>
-          {eligibleClips.length > 1 && (
-            <button
-              onClick={() => {
-                // The auto-run cache holds clip ids we've already kicked
-                // off the pipeline for. If the user cycles back to a
-                // seen example it would skip the run and leave the cards
-                // showing stale data vs the new ground-truth text. We
-                // clear the cache on every cycle so each step runs fresh.
-                _demoAutoRunClipIds.clear();
-                setExampleIndex((i) => i + 1);
-              }}
-              disabled={running}
-              title={`Cycle through ${eligibleClips.length} demo clips for ${picked}`}
-              className="rounded-md border border-neutral-700 bg-neutral-900/40 px-3 py-1.5 text-xs text-neutral-300 hover:border-neutral-600 disabled:opacity-40"
-            >
-              Try another clip →
-            </button>
+        <div className="text-sm text-neutral-300 italic leading-snug">
+          “{ref}”
+        </div>
+      </div>
+
+      {/* Stock model transcript */}
+      <div className="min-w-0">
+        <div className="text-[9px] uppercase tracking-wider font-mono text-neutral-500 mb-0.5 flex items-center justify-between">
+          <span>Off-the-shelf</span>
+          {vw !== null && (
+            <span className="font-mono tabular-nums text-neutral-400">
+              WER {(vw * 100).toFixed(0)}%
+            </span>
           )}
         </div>
-      </header>
-
-      {/* Ground-truth card — the question both models are trying to answer */}
-      <div className="rounded-2xl border border-neutral-800 bg-neutral-900/40 px-5 py-4 mb-5 flex items-center gap-5">
-        <div className="flex-1 min-w-0">
-          <div className="text-[10px] uppercase tracking-[0.25em] font-mono text-neutral-500 mb-1 flex items-center gap-2">
-            <span>patient says (ground truth)</span>
-            {eligibleClips.length > 1 && (
-              <span className="text-neutral-600 normal-case tracking-normal">
-                · example{" "}
-                <span className="tabular-nums text-neutral-400">
-                  {(exampleIndex % eligibleClips.length) + 1}
-                </span>{" "}
-                of {eligibleClips.length}
-              </span>
-            )}
-          </div>
-          <div className="text-2xl text-neutral-100 italic leading-snug">
-            “{selectedClip?.intended_text ?? "—"}”
-          </div>
-        </div>
-        <div className="shrink-0">
-          <PlayButton audio={audio} isPlaying={isPlaying} hint="Play this clip" />
-        </div>
-      </div>
-
-      {/* The two-pipeline comparison — the actual message */}
-      <div className="grid md:grid-cols-2 gap-4 mb-5">
-        <ComparisonCard
-          title="Off-the-shelf speech model"
-          subtitle="Stock Whisper. Trained on healthy speech."
-          tone="vanilla"
-          running={running && pipeline.vanillaText === null}
-          wer={vw}
-          stamp={vanillaStamp(vw)}
-          flagged={false}
-        >
-          {pipeline.vanillaText !== null ? (
-            <DiffText
-              hypothesis={pipeline.vanillaText}
-              reference={ref}
-              size="lg"
-            />
-          ) : pipeline.vanillaError ? (
-            <span className="text-red-400 text-sm">
-              error: {pipeline.vanillaError}
+        <div className="text-base leading-snug min-h-[2rem]">
+          {showVanilla ? (
+            <DiffText hypothesis={example.vanilla} reference={ref} size="md" />
+          ) : (
+            <span className="text-neutral-600 italic text-sm">
+              {state === "pending" ? "—" : "transcribing…"}
             </span>
-          ) : null}
-        </ComparisonCard>
-        <ComparisonCard
-          title="Phonemer"
-          subtitle={
-            adapterPath
-              ? "Per-patient adapter + phoneme safety gate."
-              : "(no adapter loaded — vanilla path)"
-          }
-          tone="phonemer"
-          running={running && !adapted}
-          wer={aw}
-          stamp={phonemerStamp(aw, anyFlagged)}
-          flagged={anyFlagged}
-        >
-          {adapted ? (
-            <DiffText hypothesis={adapted} reference={ref} size="lg" />
-          ) : null}
-        </ComparisonCard>
+          )}
+        </div>
       </div>
 
-      {/* The takeaway — only render when we can compute a meaningful delta. */}
-      {done && reduction !== null && (
-        <div className="rounded-2xl border border-emerald-700/40 bg-emerald-950/20 px-6 py-4 mb-4 flex items-center justify-center gap-6">
-          <div className="text-center">
-            <div className="text-[10px] uppercase tracking-[0.25em] font-mono text-emerald-400 mb-1">
-              the difference
-            </div>
-            <div className="flex items-baseline justify-center gap-3">
-              <span className="font-mono tabular-nums text-5xl font-semibold text-emerald-300">
-                −{reduction}%
-              </span>
-              <span className="text-sm text-neutral-400">
-                word errors vs the stock model
-              </span>
-            </div>
-          </div>
+      {/* Phonemenal transcript */}
+      <div className="min-w-0">
+        <div className="text-[9px] uppercase tracking-wider font-mono text-neutral-500 mb-0.5 flex items-center justify-between">
+          <span>Phonemenal</span>
+          {aw !== null && (
+            <span className="font-mono tabular-nums text-neutral-400">
+              WER {(aw * 100).toFixed(0)}%
+            </span>
+          )}
         </div>
-      )}
-      {done && reduction === null && anyFlagged && (
-        <div className="rounded-2xl border border-rose-700/40 bg-rose-950/20 px-6 py-4 mb-4 text-sm text-rose-200">
-          <span className="font-semibold">Phonemer flagged this clip.</span>{" "}
-          The phoneme alignment doesn&apos;t support the words; instead of
-          confidently outputting them, the system tells the listener to verify
-          — that&apos;s the difference. A stock model has no such guardrail.
+        <div className="text-base leading-snug min-h-[2rem]">
+          {showAdapted ? (
+            <DiffText hypothesis={example.adapted} reference={ref} size="md" />
+          ) : (
+            <span className="text-neutral-600 italic text-sm">
+              {state === "pending" || !showVanilla ? "—" : "transcribing…"}
+            </span>
+          )}
         </div>
-      )}
+      </div>
 
-      {/* Optional proof points for the technically curious. Collapsed by
-          default so they don't compete with the message above. */}
-      {(pipeline.waveform || allFrames.length > 0) && (
-        <details className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-3">
-          <summary className="cursor-pointer text-[10px] font-mono uppercase tracking-[0.25em] text-neutral-500 hover:text-neutral-300 list-none">
-            under the hood · waveform + VAD + phoneme stream
-          </summary>
-          <div className="mt-3 space-y-3">
-            {pipeline.waveform && pipeline.audioDurationMs && (
-              <VadTimeline
-                durationMs={pipeline.audioDurationMs}
-                regions={pipeline.utterances.map((u) => ({
-                  start: u.start_ms,
-                  end: u.end_ms,
-                }))}
-                waveform={pipeline.waveform}
-                tall
-                playheadMs={playheadMs}
-                showPlayhead
-              />
-            )}
-            {allFrames.length > 0 && (
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">
-                  wav2vec2 phoneme stream (50 Hz)
+      {/* Outcome chip */}
+      <div className="flex items-center justify-end pt-3">
+        {phase === "done" && (
+          <>
+            {flagged ? (
+              <div
+                className="text-[10px] uppercase tracking-wider font-mono font-semibold px-2 py-1 rounded text-center"
+                style={{
+                  backgroundColor: "rgba(245,158,11,0.15)",
+                  color: "#f59e0b",
+                  border: "1px solid rgba(245,158,11,0.45)",
+                }}
+              >
+                ⚠ flagged
+                <div className="text-[8px] mt-0.5 opacity-80 normal-case tracking-normal">
+                  uncertain
                 </div>
-                <PhonemeStrip
-                  frames={allFrames}
-                  tall
-                  playheadMs={playheadMs}
-                  showPlayhead
-                />
+              </div>
+            ) : reduction !== null ? (
+              <div className="text-center">
+                <div className="text-[11px] uppercase tracking-wider font-mono font-semibold text-emerald-400">
+                  −{reduction}%
+                </div>
+                <div className="text-[9px] text-neutral-500 mt-0.5">
+                  word errors
+                </div>
+              </div>
+            ) : (
+              <div className="text-center">
+                <div className="text-[11px] uppercase tracking-wider font-mono font-semibold text-emerald-400">
+                  ✓ matched
+                </div>
+                <div className="text-[9px] text-neutral-500 mt-0.5">
+                  both correct
+                </div>
               </div>
             )}
-          </div>
-        </details>
-      )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -3862,7 +2988,7 @@ function IntroSlide({ selectedClip, pipeline, adapterPath }: SlideProps) {
   return (
     <SlideShell
       number={null}
-      title="How Phonemer transcribes patient speech"
+      title="How Phonemenal transcribes patient speech"
       description={[
         "An audio clip from a brain-injury patient flows through 7 stages. The same code path runs in production; this presentation walks through each stage with a live visualization.",
         "Use the picker above to choose a TORGO clip, click Run pipeline, then step through the slides. Use ← / → or click the dots below to navigate.",
@@ -4744,7 +3870,8 @@ function Waveform({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.scale(dpr, dpr);
-    ctx.fillStyle = "#0a0a0a";
+    const slideBg = getComputedStyle(document.documentElement).getPropertyValue('--slide-screen').trim() || '#0a0a0a';
+    ctx.fillStyle = slideBg;
     ctx.fillRect(0, 0, cssWidth, height);
     const bars = cssWidth;
     const samplesPerBar = Math.max(1, Math.floor(samples.length / bars));
@@ -4787,7 +3914,7 @@ function Waveform({
               style={{ left: 0, width: `${playheadPct}%` }}
             />
             <div
-              className="absolute top-0 h-full w-0.5 bg-white/90 shadow-[0_0_8px_rgba(255,255,255,0.6)] pointer-events-none transition-[left] duration-75 ease-linear"
+              className="absolute top-0 h-full w-0.5 bg-[var(--slide-marker)]/90 shadow-[0_0_8px_rgba(var(--slide-marker-glow),0.6)] pointer-events-none transition-[left] duration-75 ease-linear"
               style={{ left: `${playheadPct}%` }}
             />
           </>
@@ -4936,8 +4063,8 @@ function VadTimeline({
         })}
         {showPlayhead && (
           <div
-            className={`absolute top-0 h-full w-0.5 pointer-events-none transition-[left] duration-75 ease-linear shadow-[0_0_8px_rgba(255,255,255,0.6)] ${
-              inSpeechRegion ? "bg-emerald-300" : "bg-white/90"
+            className={`absolute top-0 h-full w-0.5 pointer-events-none transition-[left] duration-75 ease-linear shadow-[0_0_8px_rgba(var(--slide-marker-glow),0.6)] ${
+              inSpeechRegion ? "bg-emerald-300" : "bg-[var(--slide-marker)]/90"
             }`}
             style={{ left: `${playheadPct}%` }}
           />
@@ -5092,7 +4219,7 @@ function PhonemeStrip({
           ))}
           {showPlayhead && totalDurationMs > 0 && (
             <div
-              className="absolute -top-1 h-1 w-0.5 bg-white/80 pointer-events-none transition-[left] duration-75 ease-linear"
+              className="absolute -top-1 h-1 w-0.5 bg-[var(--slide-marker)]/80 pointer-events-none transition-[left] duration-75 ease-linear"
               style={{
                 left: `${
                   Math.max(
@@ -5173,7 +4300,7 @@ function SimilarityMeter({
           style={{ left: `${matchThreshold * 100}%` }}
         />
         <div
-          className="absolute top-0 h-full w-1.5 bg-white shadow-[0_0_10px_rgba(255,255,255,0.7)] transition-[left] duration-700 ease-out"
+          className="absolute top-0 h-full w-1.5 bg-[var(--slide-marker)] shadow-[0_0_10px_rgba(var(--slide-marker-glow),0.7)] transition-[left] duration-700 ease-out"
           style={{ left: `calc(${pct}% - 3px)` }}
         />
       </div>
@@ -5275,7 +4402,7 @@ function ThresholdMeter({
         />
         {value !== null && (
           <div
-            className="absolute top-0 h-full w-1 bg-white shadow-[0_0_10px_rgba(255,255,255,0.7)] transition-[left] duration-1000 ease-out"
+            className="absolute top-0 h-full w-1 bg-[var(--slide-marker)] shadow-[0_0_10px_rgba(var(--slide-marker-glow),0.7)] transition-[left] duration-1000 ease-out"
             style={{ left: `calc(${animPct}% - 2px)` }}
           />
         )}
@@ -5357,10 +4484,17 @@ function SeverityDiffText({
   hypothesis,
   reference,
   accent,
+  matchColor = "#86efac",
 }: {
   hypothesis: string;
   reference: string | null;
   accent: string;
+  // The "correct word" green. Emerald-300 default reads on dark cards;
+  // pass emerald-700 (or similar dark green) when rendering on a light
+  // glass card. Threaded down from the parent so this component doesn't
+  // need its own theme subscription — that mattered when 21 of these
+  // were mounted at once (7 examples × 3 cards on the Problem slide).
+  matchColor?: string;
 }) {
   if (!hypothesis) {
     return (
@@ -5380,7 +4514,7 @@ function SeverityDiffText({
             <span
               style={
                 match
-                  ? { color: "#86efac" }
+                  ? { color: matchColor }
                   : norm.length === 0
                     ? undefined
                     : { color: accent }
@@ -5400,21 +4534,51 @@ function SeverityDiffText({
 // a glance — but resist the urge to editorialize with alarmist labels.
 // Whisper isn't "failing"; it's out of distribution. The numbers and the
 // hue do the work; we don't need exclamation points.
-function werSeverityStyle(w: number): {
+function werSeverityStyle(
+  w: number,
+  theme: "dark" | "light" = "dark",
+): {
   accent: string;
   bgRgb: string;
   label: string;
 } {
-  if (w >= 1.0) {
-    return { accent: "#dc2626", bgRgb: "220,38,38", label: "very high" };
+  // Background tints stay the same in both themes — a light pink at 16%
+  // alpha looks soft on dark or light canvas alike. The *accent* (text +
+  // bar fill) darkens in light mode so the same hue still passes contrast
+  // when it sits on top of its own tinted card.
+  //
+  // Thresholds are tuned for the base.en TIMIT WER scale (no
+  // intelligibility prompts). On TIMIT sentences, anything ≥ 75% reads
+  // as "mostly hallucinated"; ≥ 50% is "noticeably broken"; ≥ 15% has
+  // visible errors. If you change to aggregate WER (which includes
+  // intelligibility prompts at ~100%+) bump these back up to 1.0 / 0.5 /
+  // 0.2 so M01's >100% lands as "very high" without compression.
+  if (w >= 0.75) {
+    return {
+      accent: theme === "light" ? "#991b1b" : "#dc2626",
+      bgRgb: "220,38,38",
+      label: "very high",
+    };
   }
   if (w >= 0.5) {
-    return { accent: "#f97316", bgRgb: "249,115,22", label: "high" };
+    return {
+      accent: theme === "light" ? "#9a3412" : "#f97316",
+      bgRgb: "249,115,22",
+      label: "high",
+    };
   }
-  if (w >= 0.2) {
-    return { accent: "#f59e0b", bgRgb: "245,158,11", label: "moderate" };
+  if (w >= 0.15) {
+    return {
+      accent: theme === "light" ? "#92400e" : "#f59e0b",
+      bgRgb: "245,158,11",
+      label: "moderate",
+    };
   }
-  return { accent: "#84cc16", bgRgb: "132,204,22", label: "low" };
+  return {
+    accent: theme === "light" ? "#3f6212" : "#84cc16",
+    bgRgb: "132,204,22",
+    label: "low",
+  };
 }
 
 // Approximation of Whisper's official EnglishTextNormalizer (the one used

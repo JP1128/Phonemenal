@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccessibilityPanel } from "../../components/accessibility-panel";
+import { ThemeToggle } from "../../components/theme-toggle";
 import { useAccessibility } from "../../lib/accessibility";
 import { createAudioCapture } from "../../lib/audio-capture";
 import { createCalibrationClient } from "../../lib/calibration-client";
@@ -899,6 +900,7 @@ export default function CalibratePage() {
               </button>
             </>
           )}
+          <ThemeToggle />
           <AccessibilityPanel
             settings={a11y.settings}
             onChange={a11y.setSettings}
@@ -1041,7 +1043,7 @@ function WelcomeScreen({
   return (
     <div className="space-y-8">
       <div className="space-y-3 text-center">
-        <h2 className="text-3xl font-semibold">Calibrate Phonemer</h2>
+        <h2 className="text-3xl font-semibold">Calibrate Phonemenal</h2>
         <p className="opacity-80 max-w-xl mx-auto">
           Record a patient reading short sentences so the transcription model
           can be tuned to their voice. Each session is 10–20 minutes; come
@@ -1993,11 +1995,11 @@ function buildPlainLanguageSummary(profile: ProfileSummary): PlainSummary {
 
   if (profile.syllable_deletion_rate > 0.05) {
     bullets.push(
-      `You drop syllables at about ${(profile.syllable_deletion_rate * 100).toFixed(0)}% — Phonemer will look out for missing word endings and short forms.`,
+      `You drop syllables at about ${(profile.syllable_deletion_rate * 100).toFixed(0)}% — Phonemenal will look out for missing word endings and short forms.`,
     );
   } else {
     bullets.push(
-      `Your syllable structure is largely intact. Phonemer will rely mostly on phoneme-level corrections.`,
+      `Your syllable structure is largely intact. Phonemenal will rely mostly on phoneme-level corrections.`,
     );
   }
 
@@ -2016,14 +2018,14 @@ function buildPlainLanguageSummary(profile: ProfileSummary): PlainSummary {
     const clusters = Object.keys(parsed.cluster_simplifications).slice(0, 3);
     if (clusters.length > 0) {
       bullets.push(
-        `Consonant clusters Phonemer expects to be simplified: ${clusters.join(", ")}.`,
+        `Consonant clusters Phonemenal expects to be simplified: ${clusters.join(", ")}.`,
       );
     }
   }
 
   const intro =
     profile.opus_summary ??
-    "Phonemer learned how you tend to produce phonemes when reading these sentences. Here's what stood out.";
+    "Phonemenal learned how you tend to produce phonemes when reading these sentences. Here's what stood out.";
 
   return { intro, bullets };
 }

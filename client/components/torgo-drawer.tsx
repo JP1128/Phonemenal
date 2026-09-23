@@ -3,6 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SeverityBadge } from "./severity-badge";
 import { streamFileAsPcm } from "../lib/audio-capture";
+import {
+  buildRankingIndex,
+  loadDemoRanking,
+  type DemoRanking,
+  type RankingEntry,
+} from "../lib/demo-ranking";
 import type { WsMessage } from "../lib/messages";
 import { createPhonemerWs } from "../lib/phonemer-ws";
 import type { Profile } from "../lib/profile";
@@ -111,6 +117,10 @@ export function TorgoDrawer({
   calibratedSpeakers,
 }: TorgoDrawerProps) {
   const [clips, setClips] = useState<TorgoClip[] | null>(null);
+  // Pre-computed per-clip adapted-WER + gate-flag, keyed by speaker id
+  // (uppercase). Used as the primary sort key for TIMIT clips so the
+  // best-performing clips float to the top for the demo. Missing → null.
+  const [ranking, setRanking] = useState<DemoRanking | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Per-stream diagnostic log buffer (newest first). Updated as
   // messages flow in for the currently-streaming WS.
@@ -159,6 +169,21 @@ export function TorgoDrawer({
       .catch((err) => setError(`could not load TORGO clips: ${err}`));
   }, [open, clips]);
 
+  // Fetch the demo ranking once per drawer open. Cached in-module via
+  // loadDemoRanking, so re-opens are free. A missing file is non-fatal —
+  // the clip list just falls back to the existing prompt-set / id order.
+  useEffect(() => {
+    if (!open) return;
+    if (ranking !== null) return;
+    let cancelled = false;
+    loadDemoRanking().then((r) => {
+      if (!cancelled && r) setRanking(r);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, ranking]);
+
   // For the Demo profile the speaker picker shows the uncalibrated
   // dysarthric set (F01 / F04 / M02 / M03 / M04 / M05 in practice).
   // Controls are intentionally excluded — the demo bucket is for
@@ -196,6 +221,15 @@ export function TorgoDrawer({
     }
   }, [profile.kind, demoSpeakers, demoSpeaker]);
 
+  // Per-speaker clip → ranking entry lookup. Built once per
+  // (ranking, activeSpeaker) pair; the sort below uses it to pull
+  // adapted_wer / adapted_flagged into the comparator without
+  // re-scanning the ranking array per comparison.
+  const rankingIndex = useMemo<Map<number, RankingEntry>>(() => {
+    if (!activeSpeaker) return new Map();
+    return buildRankingIndex(ranking, activeSpeaker);
+  }, [ranking, activeSpeaker]);
+
   const speakerClips = useMemo(() => {
     if (!clips || !activeSpeaker) return [];
     // Order: sentences first (timit), then single words (intelligibility),
@@ -215,6 +249,23 @@ export function TorgoDrawer({
     // been trained, so the per-clip cal/eval bucket is just a pre-computed
     // label that doesn't correspond to anything real — ignore the filter.
     const applySplit = profile.kind === "calibrated";
+    // Demo-ranking sort key (lower = plays earlier). Ranked + unflagged
+    // clips sort first by adapted_wer ascending; flagged ranked clips
+    // sink to the bottom of the ranked block; unranked clips keep their
+    // historical (prompt-set, id) order behind everything ranked.
+    const rankKey = (c: TorgoClip): [number, number, number] => {
+      const r = rankingIndex.get(c.id);
+      if (!r) {
+        return [
+          1, // unranked → after every ranked clip
+          PROMPT_ORDER[c.prompt_set ?? "unknown"] ?? 99,
+          c.id,
+        ];
+      }
+      // Ranked block split into two strata: unflagged (0) before flagged (1),
+      // each internally sorted by adapted_wer ascending.
+      return [0, r.adapted_flagged ? 1 : 0, r.adapted_wer];
+    };
     return clips
       .filter((c) => {
         if (c.speaker_id.toUpperCase() !== targetSpeaker) return false;
@@ -228,12 +279,22 @@ export function TorgoDrawer({
       })
       .slice()
       .sort((a, b) => {
-        const ao = PROMPT_ORDER[a.prompt_set ?? "unknown"] ?? 99;
-        const bo = PROMPT_ORDER[b.prompt_set ?? "unknown"] ?? 99;
-        if (ao !== bo) return ao - bo;
-        return a.id - b.id;
+        const ka = rankKey(a);
+        const kb = rankKey(b);
+        for (let i = 0; i < ka.length; i++) {
+          if (ka[i] !== kb[i]) return ka[i] - kb[i];
+        }
+        return 0;
       });
-  }, [clips, activeSpeaker, showNonWord, setFilter, splitFilter, profile.kind]);
+  }, [
+    clips,
+    activeSpeaker,
+    showNonWord,
+    setFilter,
+    splitFilter,
+    profile.kind,
+    rankingIndex,
+  ]);
 
   const playClipAudio = useCallback((clip: TorgoClip) => {
     const el = audioRef.current;

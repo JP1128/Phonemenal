@@ -1,5 +1,7 @@
 "use client";
 
+import { displayNameFor } from "./torgo-speakers";
+
 /**
  * The active "patient" the UI is configured for.
  *
@@ -128,6 +130,8 @@ export function profileLabel(
   speakers?: CalibratedSpeaker[] | null,
 ): string {
   if (p.kind === "calibrated") {
+    const demoName = displayNameFor(p.speakerId);
+    if (demoName) return demoName;
     if (speakers) {
       const hit = speakers.find((s) => s.id === p.speakerId);
       if (hit) return hit.label;

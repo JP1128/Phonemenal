@@ -60,7 +60,7 @@ export default function AudioDiagnosticsPage() {
     <main className="min-h-screen bg-neutral-950 text-neutral-100 font-mono p-6 space-y-5">
       <header className="flex items-center gap-3 flex-wrap">
         <h1 className="text-xl font-semibold tracking-wide">
-          Phonemer · Audio diagnostics
+          Phonemenal · Audio diagnostics
         </h1>
         <a
           href="/debug"
